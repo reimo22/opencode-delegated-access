@@ -1,4 +1,5 @@
 import { sendNotification } from "../notify/notify.ts"
+import type { Logger } from "../log.ts"
 
 /**
  * Programmatic permission resolver injected by the caller. Resolves the
@@ -46,6 +47,12 @@ export async function runRiskyPathInBackground(args: {
   reason: string
   sound: boolean
   timeoutSec: number
+  /**
+   * Records the notification's outcome. Without this the notifier is a black
+   * box: it is fire-and-forget, so "was the user ever actually notified?" is
+   * unanswerable from the outside.
+   */
+  log?: Logger
 }): Promise<void> {
   const { reply, command, reason, sound, timeoutSec } = args
 
@@ -63,6 +70,19 @@ export async function runRiskyPathInBackground(args: {
     sound,
     timeoutSec,
   })
+
+  if (result.type === "error") {
+    // Degraded, not broken: the TUI prompt is still live. Worth a warning
+    // because it silently removes the notification affordance.
+    args.log?.warn("risky notification failed; TUI prompt remains", {
+      error: result.error.message,
+    })
+  } else {
+    args.log?.debug("risky notification outcome", {
+      outcome: result.type,
+      ...(result.type === "action" ? { label: result.label } : {}),
+    })
+  }
 
   if (result.type !== "action") return
 

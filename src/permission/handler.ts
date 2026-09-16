@@ -561,6 +561,7 @@ function maybeNotifyClassifierFailure(args: {
     suppressedCount: decision.suppressedCount,
     sound: ctx.config.notificationSound,
     timeoutSec: 60,
+    log: ctx.log,
   })
 }
 
@@ -623,6 +624,7 @@ async function runSafeOrRiskyPath(args: {
     reason: verdict.reason,
     sound: ctx.config.notificationSound,
     timeoutSec: 60,
+    log: ctx.log,
   })
 }
 

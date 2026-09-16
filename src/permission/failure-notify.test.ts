@@ -4,6 +4,7 @@ import {
   runFailureNotificationInBackground,
 } from "./failure-notify.ts"
 import type { NotifyActionResult } from "../notify/notify.ts"
+import { makeLogger } from "../testing/v2-fixtures.ts"
 
 describe("FailureNotifyRateLimiter", () => {
   it("allows the first failure", () => {
@@ -167,5 +168,27 @@ describe("runFailureNotificationInBackground", () => {
         sendNotification: sendNotification as never,
       }),
     ).resolves.toBeUndefined()
+  })
+
+  it("records a notifier error as a warning, since that silently drops the notification affordance", async () => {
+    const sendNotification = vi.fn(
+      async () =>
+        ({ type: "error", error: new Error("no notification daemon") }) as NotifyActionResult,
+    )
+    const reply = makeReply()
+    const log = makeLogger()
+
+    await runFailureNotificationInBackground({
+      ...baseArgs,
+      reply,
+      sendNotification: sendNotification as never,
+      log,
+    })
+
+    expect(reply).not.toHaveBeenCalled()
+    expect(log.warn).toHaveBeenCalledWith(
+      "classifier-failure notification failed; TUI prompt remains",
+      { error: "no notification daemon" },
+    )
   })
 })

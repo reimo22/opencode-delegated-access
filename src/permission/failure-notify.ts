@@ -4,6 +4,7 @@ import {
 } from "../notify/notify.ts"
 import type { ClassifyFailureClass } from "../classifier/classify.ts"
 import type { PermissionReplier } from "./risky-path.ts"
+import type { Logger } from "../log.ts"
 
 /** Upper bound on the command string we embed in the notification body. */
 const COMMAND_DISPLAY_MAX = 160
@@ -92,6 +93,8 @@ export async function runFailureNotificationInBackground(args: {
   suppressedCount: number
   sound: boolean
   timeoutSec: number
+  /** Records the notification's outcome (it is otherwise fire-and-forget). */
+  log?: Logger
   /** Injectable for tests; defaults to the real OS notifier. */
   sendNotification?: (args: {
     title: string
@@ -132,6 +135,17 @@ export async function runFailureNotificationInBackground(args: {
     sound,
     timeoutSec,
   })
+
+  if (result.type === "error") {
+    args.log?.warn("classifier-failure notification failed; TUI prompt remains", {
+      error: result.error.message,
+    })
+  } else {
+    args.log?.debug("classifier-failure notification outcome", {
+      outcome: result.type,
+      ...(result.type === "action" ? { label: result.label } : {}),
+    })
+  }
 
   if (result.type !== "action" || result.label !== REJECT_LABEL) return
 

@@ -7,6 +7,7 @@ vi.mock("../notify/notify.ts", () => ({
 import { sendNotification } from "../notify/notify.ts"
 import type { NotifyActionResult } from "../notify/notify.ts"
 import { runRiskyPathInBackground } from "./risky-path.ts"
+import { makeLogger } from "../testing/v2-fixtures.ts"
 
 const mockedSend = vi.mocked(sendNotification)
 
@@ -112,6 +113,40 @@ describe("runRiskyPathInBackground", () => {
     await runRiskyPathInBackground({ ...baseArgs, reply })
     // No reply for unknown actions; TUI prompt remains live.
     expect(reply).not.toHaveBeenCalled()
+  })
+
+  it("records a notifier error as a warning, since that silently drops the notification affordance", async () => {
+    mockedSend.mockResolvedValueOnce({
+      type: "error",
+      error: new Error("no notification daemon"),
+    } as NotifyActionResult)
+    const reply = makeReply()
+    const log = makeLogger()
+
+    await runRiskyPathInBackground({ ...baseArgs, reply, log })
+
+    expect(reply).not.toHaveBeenCalled()
+    expect(log.warn).toHaveBeenCalledWith(
+      "risky notification failed; TUI prompt remains",
+      { error: "no notification daemon" },
+    )
+    expect(log.debug).not.toHaveBeenCalled()
+  })
+
+  it("records the notification outcome so the notifier is observable", async () => {
+    mockedSend.mockResolvedValueOnce({
+      type: "action",
+      label: "Approve",
+    } as NotifyActionResult)
+    const reply = makeReply()
+    const log = makeLogger()
+
+    await runRiskyPathInBackground({ ...baseArgs, reply, log })
+
+    expect(log.debug).toHaveBeenCalledWith("risky notification outcome", {
+      outcome: "action",
+      label: "Approve",
+    })
   })
 
   it("passes Approve + Reject as action buttons, command + reason as context", async () => {

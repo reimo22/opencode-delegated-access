@@ -1,14 +1,16 @@
-import { describe, it, expect, vi, beforeEach } from "vitest"
+import { describe, it, expect, vi, beforeEach, afterEach } from "vitest"
 import { sendNotification } from "./notify.ts"
 import type { NotifyActionResult } from "./notify.ts"
 
-// We mock the NotificationCenter constructor so tests don't pop a real
-// notification. The mock invokes the `notify` callback synchronously with
-// whatever the test scenario requires.
+// Mock node-notifier: `default` is the cross-platform entry point (notify-send
+// on Linux), `NotificationCenter` is the macOS-only constructor. Keeping both
+// on the same module lets tests assert which backend a platform selects.
 vi.mock("node-notifier", () => {
+  const notify = vi.fn()
   const NotificationCenter = vi.fn()
   return {
-    default: { NotificationCenter },
+    default: { notify, NotificationCenter },
+    notify,
     NotificationCenter,
   }
 })
@@ -30,46 +32,63 @@ type NotifyCallback = (
   metadata?: { activationType?: string; activationValue?: string },
 ) => void
 
-/**
- * Capture the last NotificationCenter instance constructed so tests can
- * assert on constructor calls and invoke the captured callback.
- */
-function installMockScenario(scenario: {
-  callback?: (cb: NotifyCallback, options: NotifyArgs) => void
+const crossPlatformEntry = nn as unknown as {
+  notify: ReturnType<typeof vi.fn>
+}
+const NotificationCenter = (
+  nn as unknown as { NotificationCenter: ReturnType<typeof vi.fn> }
+).NotificationCenter
+
+/** Install a scenario on the cross-platform backend and capture its options. */
+function scenarioOnCrossPlatform(s: {
+  callback?: (cb: NotifyCallback) => void
 }) {
-  const MockCtor = (nn as unknown as { NotificationCenter: unknown })
-    .NotificationCenter as ReturnType<typeof vi.fn>
+  const seen: NotifyArgs[] = []
+  crossPlatformEntry.notify.mockImplementation(
+    (options: NotifyArgs, cb: NotifyCallback) => {
+      seen.push(options)
+      s.callback?.(cb)
+    },
+  )
+  return seen
+}
 
-  const instances: {
-    notify: ReturnType<typeof vi.fn>
-    lastOptions?: NotifyArgs
-  }[] = []
+/** Install a scenario on the macOS NotificationCenter backend. */
+function scenarioOnNotificationCenter(s: {
+  callback?: (cb: NotifyCallback) => void
+}) {
+  const seen: NotifyArgs[] = []
+  NotificationCenter.mockImplementation(() => ({
+    notify: (options: NotifyArgs, cb: NotifyCallback) => {
+      seen.push(options)
+      s.callback?.(cb)
+    },
+  }))
+  return seen
+}
 
-  MockCtor.mockImplementation(() => {
-    const self: {
-      notify: ReturnType<typeof vi.fn>
-      lastOptions?: NotifyArgs
-    } = {
-      notify: vi.fn((options: NotifyArgs, cb: NotifyCallback) => {
-        self.lastOptions = options
-        scenario.callback?.(cb, options)
-      }),
-    }
-    instances.push(self)
-    return self
-  })
-
-  return instances
+const realPlatform = process.platform
+function stubPlatform(value: string) {
+  Object.defineProperty(process, "platform", { value, configurable: true })
 }
 
 beforeEach(() => {
   vi.clearAllMocks()
+  stubPlatform("linux")
 })
 
-describe("sendNotification", () => {
+afterEach(() => {
+  stubPlatform(realPlatform)
+})
+
+describe("sendNotification — macOS (NotificationCenter backend)", () => {
+  beforeEach(() => {
+    stubPlatform("darwin")
+  })
+
   it("resolves with { type: 'action', label } when user clicks a button", async () => {
-    installMockScenario({
-      callback: (cb, _options) => {
+    scenarioOnNotificationCenter({
+      callback: (cb) => {
         cb(null, "activate", {
           activationType: "actionClicked",
           activationValue: "Approve",
@@ -91,10 +110,8 @@ describe("sendNotification", () => {
   })
 
   it("resolves with { type: 'cancel' } when user dismisses / closes", async () => {
-    installMockScenario({
-      callback: (cb) => {
-        cb(null, "closed", { activationType: "closed" })
-      },
+    scenarioOnNotificationCenter({
+      callback: (cb) => cb(null, "closed", { activationType: "closed" }),
     })
 
     const result = await sendNotification({
@@ -107,10 +124,8 @@ describe("sendNotification", () => {
   })
 
   it("resolves with { type: 'timeout' } when the notification times out", async () => {
-    installMockScenario({
-      callback: (cb) => {
-        cb(null, "timeout", { activationType: "timeout" })
-      },
+    scenarioOnNotificationCenter({
+      callback: (cb) => cb(null, "timeout", { activationType: "timeout" }),
     })
 
     const result = await sendNotification({ title: "t", message: "m" })
@@ -118,10 +133,8 @@ describe("sendNotification", () => {
   })
 
   it("resolves with { type: 'click' } when user clicks the notification body", async () => {
-    installMockScenario({
-      callback: (cb) => {
-        cb(null, "activate", { activationType: "contentsClicked" })
-      },
+    scenarioOnNotificationCenter({
+      callback: (cb) => cb(null, "activate", { activationType: "contentsClicked" }),
     })
 
     const result = await sendNotification({ title: "t", message: "m" })
@@ -129,10 +142,8 @@ describe("sendNotification", () => {
   })
 
   it("resolves with { type: 'error' } on notifier error", async () => {
-    installMockScenario({
-      callback: (cb) => {
-        cb(new Error("broke"), "")
-      },
+    scenarioOnNotificationCenter({
+      callback: (cb) => cb(new Error("broke"), ""),
     })
 
     const result = await sendNotification({ title: "t", message: "m" })
@@ -142,10 +153,9 @@ describe("sendNotification", () => {
     }
   })
 
-  it("passes the actions and closeLabel through to node-notifier", async () => {
-    const instances = installMockScenario({
-      callback: (cb) =>
-        cb(null, "timeout", { activationType: "timeout" }),
+  it("passes actions, closeLabel, timeout and sound through to node-notifier", async () => {
+    const seen = scenarioOnNotificationCenter({
+      callback: (cb) => cb(null, "timeout", { activationType: "timeout" }),
     })
 
     await sendNotification({
@@ -157,31 +167,81 @@ describe("sendNotification", () => {
       sound: false,
     })
 
-    expect(instances.length).toBe(1)
-    const lastOpts = instances[0]?.lastOptions
-    expect(lastOpts?.actions).toEqual(["A", "B"])
-    expect(lastOpts?.closeLabel).toBe("Dismiss")
-    expect(lastOpts?.timeout).toBe(42)
-    expect(lastOpts?.sound).toBe(false)
+    expect(seen.length).toBe(1)
+    expect(seen[0]?.actions).toEqual(["A", "B"])
+    expect(seen[0]?.closeLabel).toBe("Dismiss")
+    expect(seen[0]?.timeout).toBe(42)
+    expect(seen[0]?.sound).toBe(false)
+    expect(seen[0]?.wait).toBe(true)
   })
 
   it("defaults sound to true when not specified", async () => {
-    const instances = installMockScenario({
-      callback: (cb) =>
-        cb(null, "timeout", { activationType: "timeout" }),
+    const seen = scenarioOnNotificationCenter({
+      callback: (cb) => cb(null, "timeout", { activationType: "timeout" }),
     })
 
     await sendNotification({ title: "t", message: "m" })
-    expect(instances[0]?.lastOptions?.sound).toBe(true)
+    expect(seen[0]?.sound).toBe(true)
+  })
+})
+
+describe("sendNotification — non-macOS backend selection", () => {
+  it("uses the cross-platform entry point, not NotificationCenter", async () => {
+    const seen = scenarioOnCrossPlatform({
+      callback: (cb) => cb(null, "read-only notification"),
+    })
+
+    const result = await sendNotification({
+      title: "t",
+      message: "m",
+      actions: ["Approve", "Reject"],
+    })
+
+    expect(crossPlatformEntry.notify).toHaveBeenCalledTimes(1)
+    // The regression this guards: constructing NotificationCenter on Linux
+    // fails with "You need Mac OS X 10.8 or above…", so every notification
+    // silently became an error and the user was never told anything.
+    expect(NotificationCenter).not.toHaveBeenCalled()
+    expect(seen[0]?.title).toBe("t")
+    expect(seen[0]?.message).toBe("m")
+    expect(result.type).toBe("timeout")
   })
 
-  it("passes wait: true so that the callback fires on user action", async () => {
-    const instances = installMockScenario({
-      callback: (cb) =>
-        cb(null, "timeout", { activationType: "timeout" }),
+  it("treats a plain notify-send success as informational (no buttons available)", async () => {
+    // notify-send reports no activationType, so the only safe reading is
+    // "the user saw it and did not choose anything": the TUI prompt decides.
+    scenarioOnCrossPlatform({ callback: (cb) => cb(null, "") })
+
+    const result = await sendNotification({
+      title: "t",
+      message: "m",
+      actions: ["Approve", "Reject"],
     })
 
-    await sendNotification({ title: "t", message: "m" })
-    expect(instances[0]?.lastOptions?.wait).toBe(true)
+    expect(result.type).toBe("timeout")
+  })
+
+  it("still surfaces a notifier error", async () => {
+    scenarioOnCrossPlatform({
+      callback: (cb) => cb(new Error("notify-send missing"), ""),
+    })
+
+    const result = await sendNotification({ title: "t", message: "m" })
+    expect(result).toEqual<NotifyActionResult>({
+      type: "error",
+      error: expect.any(Error),
+    })
+  })
+
+  it("does not treat notify-send stderr noise as a failure", async () => {
+    // node-notifier passes stderr in the error slot; a displayed notification
+    // that printed a warning must not be reported as failed.
+    scenarioOnCrossPlatform({
+      callback: (cb) =>
+        cb("Gtk-WARNING: cannot open display: " as never, ""),
+    })
+
+    const result = await sendNotification({ title: "t", message: "m" })
+    expect(result.type).toBe("timeout")
   })
 })
