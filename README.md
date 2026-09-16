@@ -1,3 +1,13 @@
+> **Fork notice (reimo22/opencode-delegated-access):** this fork exists to hold
+> a port of [jdtzmn/opencode-delegated-access](https://github.com/jdtzmn/opencode-delegated-access)
+> to the OpenCode V2 plugin API (`@opencode/plugin`, `Plugin.define` with
+> `ctx.*` domains), which upstream does not have yet (upstream is V1,
+> dormant since 2026-06, latest release v0.4.0).
+>
+> - **`main`** — currently identical to upstream v0.4.0 (V1-only, OpenCode 1.x).
+> - **`v2` branch** — the V2 port. Not started yet.
+
+---
 # Delegated Access
 
 Stop smashing the Approve button. Delegated Access gives [OpenCode](https://opencode.ai) an AI safety reviewer that auto-approves the boring stuff and escalates the scary stuff to your desktop, so you can actually keep working instead of babysitting the terminal.
