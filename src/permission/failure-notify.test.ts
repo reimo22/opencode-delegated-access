@@ -47,25 +47,12 @@ describe("FailureNotifyRateLimiter", () => {
   })
 })
 
-/** Build a client that records the permission-respond call. */
-function mockClient() {
-  const respond = vi.fn(
-    async (_opts: {
-      path: { id: string; permissionID: string }
-      body: { response: string }
-    }) => ({ data: true }),
-  )
-  return {
-    client: {
-      postSessionIdPermissionsPermissionId: respond,
-    } as never,
-    respond,
-  }
+/** V2 injects a replier instead of exposing the SDK client. */
+function makeReply(impl?: () => Promise<void>) {
+  return vi.fn(impl ?? (async () => {}))
 }
 
 const baseArgs = {
-  sessionID: "sess_1",
-  permissionID: "perm_1",
   command: "whoami && date",
   failureClass: "timeout" as const,
   suppressedCount: 0,
@@ -81,11 +68,11 @@ describe("runFailureNotificationInBackground", () => {
       sent.push(a as never)
       return { type: "timeout" } as NotifyActionResult
     })
-    const { client } = mockClient()
+    const reply = makeReply()
 
     await runFailureNotificationInBackground({
       ...baseArgs,
-      client,
+      reply,
       sendNotification: sendNotification as never,
     })
 
@@ -99,22 +86,20 @@ describe("runFailureNotificationInBackground", () => {
     const sendNotification = vi.fn(
       async () => ({ type: "action", label: "Reject" }) as NotifyActionResult,
     )
-    const { client, respond } = mockClient()
+    const reply = makeReply()
 
     await runFailureNotificationInBackground({
       ...baseArgs,
-      client,
+      reply,
       sendNotification: sendNotification as never,
     })
 
-    expect(respond).toHaveBeenCalledTimes(1)
-    const call = respond.mock.calls[0]?.[0]
-    expect(call?.body.response).toBe("reject")
-    expect(call?.path.permissionID).toBe("perm_1")
+    expect(reply).toHaveBeenCalledTimes(1)
+    expect(reply).toHaveBeenCalledWith("reject")
   })
 
   it("does NOT resolve the permission on timeout/cancel/click (TUI prompt stays)", async () => {
-    const { client, respond } = mockClient()
+    const reply = makeReply()
     for (const result of [
       { type: "timeout" },
       { type: "cancel" },
@@ -123,11 +108,11 @@ describe("runFailureNotificationInBackground", () => {
       const sendNotification = vi.fn(async () => result)
       await runFailureNotificationInBackground({
         ...baseArgs,
-        client,
+        reply,
         sendNotification: sendNotification as never,
       })
     }
-    expect(respond).not.toHaveBeenCalled()
+    expect(reply).not.toHaveBeenCalled()
   })
 
   it("mentions the failure class in the notification title", async () => {
@@ -136,12 +121,12 @@ describe("runFailureNotificationInBackground", () => {
       titles.push(a.title)
       return { type: "timeout" } as NotifyActionResult
     })
-    const { client } = mockClient()
+    const reply = makeReply()
 
     await runFailureNotificationInBackground({
       ...baseArgs,
       failureClass: "timeout",
-      client,
+      reply,
       sendNotification: sendNotification as never,
     })
 
@@ -154,12 +139,12 @@ describe("runFailureNotificationInBackground", () => {
       messages.push(a.message)
       return { type: "timeout" } as NotifyActionResult
     })
-    const { client } = mockClient()
+    const reply = makeReply()
 
     await runFailureNotificationInBackground({
       ...baseArgs,
       suppressedCount: 3,
-      client,
+      reply,
       sendNotification: sendNotification as never,
     })
 
@@ -167,13 +152,10 @@ describe("runFailureNotificationInBackground", () => {
     expect(messages[0]).toMatch(/4|3 more|\+3/)
   })
 
-  it("swallows SDK errors (TUI prompt remains as fallback)", async () => {
-    const respond = vi.fn(async () => {
-      throw new Error("sdk boom")
+  it("swallows reply errors (TUI prompt remains as fallback)", async () => {
+    const reply = makeReply(async () => {
+      throw new Error("reply boom")
     })
-    const client = {
-      postSessionIdPermissionsPermissionId: respond,
-    } as never
     const sendNotification = vi.fn(
       async () => ({ type: "action", label: "Reject" }) as NotifyActionResult,
     )
@@ -181,7 +163,7 @@ describe("runFailureNotificationInBackground", () => {
     await expect(
       runFailureNotificationInBackground({
         ...baseArgs,
-        client,
+        reply,
         sendNotification: sendNotification as never,
       }),
     ).resolves.toBeUndefined()

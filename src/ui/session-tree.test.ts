@@ -2,77 +2,69 @@ import { describe, it, expect, vi } from "vitest"
 import { resolveRootSessionID } from "./session-tree.ts"
 
 /**
- * Build a mock opencode client whose `session.get` resolves sessionIDs to
- * their `{ parentID }` shape from a provided map. IDs missing from the map
- * throw a "Not found" error so we can exercise the fail-closed path.
+ * Build a mock V2 session domain whose `get` resolves sessionIDs to their
+ * `{ parentID }` shape from a provided map. IDs missing from the map throw a
+ * "Not found" error so we can exercise the fail-closed path.
  *
- * Returns both the client and a spy on `session.get` so tests can assert on
+ * Returns both the session domain and a spy on `get` so tests can assert on
  * the call sequence.
  */
-function buildClient(parents: Record<string, string | undefined>) {
-  const get = vi.fn(async ({ path }: { path: { id: string } }) => {
-    if (!(path.id in parents)) {
-      throw new Error(`Session ${path.id} not found`)
+function buildSession(parents: Record<string, string | undefined>) {
+  const get = vi.fn(async ({ sessionID }: { sessionID: string }) => {
+    if (!(sessionID in parents)) {
+      throw new Error(`Session ${sessionID} not found`)
     }
-    const parentID = parents[path.id]
-    return {
-      data: {
-        id: path.id,
-        projectID: "proj",
-        directory: "/",
-        title: "t",
-        version: "v",
-        time: { created: 0, updated: 0 },
-        ...(parentID !== undefined ? { parentID } : {}),
-      },
-    }
+    const parentID = parents[sessionID]
+    return parentID !== undefined
+      ? { id: sessionID, parentID }
+      : { id: sessionID }
   })
   return {
-    client: { session: { get } },
+    session: { get },
     get,
   }
 }
 
 describe("resolveRootSessionID", () => {
   it("returns the input sessionID when the session has no parent (root)", async () => {
-    const { client, get } = buildClient({ root: undefined })
-    const result = await resolveRootSessionID(client as never, "root")
+    const { session, get } = buildSession({ root: undefined })
+    const result = await resolveRootSessionID(session as never, "root")
     expect(result).toBe("root")
     expect(get).toHaveBeenCalledTimes(1)
   })
 
   it("walks up one level to find the root", async () => {
-    const { client } = buildClient({
+    const { session } = buildSession({
       child: "root",
       root: undefined,
     })
-    const result = await resolveRootSessionID(client as never, "child")
+    const result = await resolveRootSessionID(session as never, "child")
     expect(result).toBe("root")
   })
 
   it("walks up multiple levels to find the root", async () => {
-    const { client } = buildClient({
+    const { session } = buildSession({
       leaf: "mid2",
       mid2: "mid1",
       mid1: "root",
       root: undefined,
     })
-    const result = await resolveRootSessionID(client as never, "leaf")
+    const result = await resolveRootSessionID(session as never, "leaf")
     expect(result).toBe("root")
   })
 
   it("returns null when session.get throws at the starting session", async () => {
-    const { client } = buildClient({})
-    const result = await resolveRootSessionID(client as never, "missing")
+    const { session } = buildSession({})
+    const result = await resolveRootSessionID(session as never, "missing")
     expect(result).toBeNull()
   })
 
   it("returns null when session.get throws mid-chain", async () => {
-    const { client } = buildClient({
+    const { session } = buildSession({
       leaf: "mid",
       // mid intentionally absent from the map → throws
     })
-    const result = await resolveRootSessionID(client as never, "leaf")
+    const result = await resolveRootSessionID(session as never, "leaf")
     expect(result).toBeNull()
   })
 
@@ -81,8 +73,8 @@ describe("resolveRootSessionID", () => {
     const chain: Record<string, string | undefined> = {}
     for (let i = 11; i > 0; i--) chain[`n${i}`] = `n${i - 1}`
     chain.n0 = undefined
-    const { client } = buildClient(chain)
-    const result = await resolveRootSessionID(client as never, "n11")
+    const { session } = buildSession(chain)
+    const result = await resolveRootSessionID(session as never, "n11")
     expect(result).toBeNull()
   })
 
@@ -92,8 +84,8 @@ describe("resolveRootSessionID", () => {
     for (let i = 9; i > 0; i--) chain[`n${i}`] = `n${i - 1}`
     chain.n0 = undefined
     chain.leaf = "n9"
-    const { client, get } = buildClient(chain)
-    const result = await resolveRootSessionID(client as never, "leaf")
+    const { session, get } = buildSession(chain)
+    const result = await resolveRootSessionID(session as never, "leaf")
     expect(result).toBe("n0")
     // 11 levels fetched: leaf, n9..n0.
     expect(get).toHaveBeenCalledTimes(11)
@@ -101,27 +93,25 @@ describe("resolveRootSessionID", () => {
 
   it("returns null on a cycle (session appears twice in the chain)", async () => {
     // A → B → A → ... (cycle)
-    const { client } = buildClient({
+    const { session } = buildSession({
       a: "b",
       b: "a",
     })
-    const result = await resolveRootSessionID(client as never, "a")
+    const result = await resolveRootSessionID(session as never, "a")
     expect(result).toBeNull()
   })
 
   it("returns null on a self-cycle (parentID equals own ID)", async () => {
-    const { client } = buildClient({ self: "self" })
-    const result = await resolveRootSessionID(client as never, "self")
+    const { session } = buildSession({ self: "self" })
+    const result = await resolveRootSessionID(session as never, "self")
     expect(result).toBeNull()
   })
 
-  it("treats a missing/empty data payload as failure", async () => {
-    const client = {
-      session: {
-        get: vi.fn(async () => ({ data: undefined })),
-      },
+  it("treats a missing session payload as failure", async () => {
+    const session = {
+      get: vi.fn(async () => undefined),
     }
-    const result = await resolveRootSessionID(client as never, "x")
+    const result = await resolveRootSessionID(session as never, "x")
     expect(result).toBeNull()
   })
 })

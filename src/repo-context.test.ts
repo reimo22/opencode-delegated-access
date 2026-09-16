@@ -4,17 +4,13 @@ import {
   RepoContextCache,
   type BunShellLike,
   type DualRepoContext,
-  type ShellOutput,
-  type ShellPromise,
 } from "./repo-context.ts"
 
 /**
- * Build a fake bun-shell tag that returns canned outputs based on which
- * command appears in the template literal's interpolated arguments.
- *
- * The handler runs `sh -c <escaped>` so the interpolated arg is the entire
- * shell-escaped command string. We match by substring (e.g. "git rev-parse"
- * or "gh pr view") rather than by exact equality.
+ * Build a fake async shell that returns canned outputs based on which command
+ * is being run. V2 passes argv (`["git", "rev-parse", ...]`) plus a cwd, so we
+ * match by substring of the joined argv (e.g. "git rev-parse" or "gh pr view")
+ * rather than by exact equality.
  */
 function makeShell(
   responders: Array<{
@@ -27,59 +23,17 @@ function makeShell(
   }>,
 ): { $: BunShellLike; calls: string[] } {
   const calls: string[] = []
-  const $ = ((_strings: TemplateStringsArray, ...exprs: unknown[]) => {
-    // Flatten so [exe, [...rest]] becomes "exe arg1 arg2 ...".
-    const flat = exprs.flatMap((e) =>
-      Array.isArray(e) ? e.map(String) : [String(e)],
-    )
-    const cmd = flat.join(" ")
-    calls.push(cmd)
-    const responder = responders.find((r) => cmd.includes(r.match))
+  const $: BunShellLike = async (cmd, _cwd) => {
+    const command = cmd.join(" ")
+    calls.push(command)
+    const responder = responders.find((r) => command.includes(r.match))
+    if (!responder) return { exitCode: 1, stdout: "" }
 
-    const buildOutput = (
-      stdout: string,
-      exitCode: number,
-    ): ShellOutput => ({
-      exitCode,
-      text: () => stdout,
-    })
-
-    let resolveResult: (v: ShellOutput) => void = () => {}
-    let rejectResult: (e: unknown) => void = () => {}
-    const inner = new Promise<ShellOutput>((res, rej) => {
-      resolveResult = res
-      rejectResult = rej
-    })
-
-    // Wrap the inner Promise so .cwd/.quiet/.nothrow chain through.
-    const promise = inner as unknown as ShellPromise
-    ;(promise as unknown as { cwd: (c: string) => ShellPromise }).cwd = () =>
-      promise
-    ;(promise as unknown as { quiet: () => ShellPromise }).quiet = () =>
-      promise
-    ;(promise as unknown as { nothrow: () => ShellPromise }).nothrow = () =>
-      promise
-
-    if (!responder) {
-      resolveResult(buildOutput("", 1))
-    } else {
-      Promise.resolve(responder.respond())
-        .then((res) => {
-          if (res === "throw") {
-            rejectResult(new Error("command failed"))
-            return
-          }
-          if (res === "hang") {
-            // never resolve
-            return
-          }
-          resolveResult(buildOutput(res.stdout, res.exitCode))
-        })
-        .catch(rejectResult)
-    }
-
-    return promise
-  }) as BunShellLike
+    const res = await responder.respond()
+    if (res === "throw") throw new Error("command failed")
+    if (res === "hang") return new Promise(() => {}) // never resolves
+    return { exitCode: res.exitCode, stdout: res.stdout }
+  }
 
   return { $, calls }
 }
