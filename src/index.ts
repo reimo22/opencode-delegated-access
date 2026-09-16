@@ -14,6 +14,7 @@ import { PendingSubjectsMap } from "./permission/pending-subjects.ts"
 import { FailureNotifyRateLimiter } from "./permission/failure-notify.ts"
 import {
   EphemeralSystemRegistry,
+  registerEphemeralIsolationHooks,
 } from "./classifier/ephemeral-system.ts"
 import { sendNotification } from "./notify/notify.ts"
 import type { ModelRef } from "./classifier/model.ts"
@@ -270,14 +271,12 @@ const DelegatedAccess = Plugin.define({
     // --- Hook 2: session context isolation for ephemeral classifier sessions
     // (system prompt replacement + total tool denial). Registered for ALL
     // sessions but a no-op for every session not in the ephemeral registry.
-    await ctx.session.hook("context", (ev) => {
-      if (!ephemeralSessionIDs.has(ev.sessionID)) return
-      const systemPrompt = ephemeralSystemRegistry.get(ev.sessionID)
-      if (systemPrompt === undefined) return
-      ev.system = [{ type: "text", text: systemPrompt }]
-      ev.tools = {}
-      log.debug("classifier context isolated", { sessionID: ev.sessionID })
-    })
+    await registerEphemeralIsolationHooks(
+      ctx.session,
+      ephemeralSessionIDs,
+      ephemeralSystemRegistry,
+      (sessionID) => log.debug("classifier context isolated", { sessionID }),
+    )
 
     // --- Hook 3: permission.replied → approval history -----------------------
     const repliedEvents = await ctx.event.subscribe()

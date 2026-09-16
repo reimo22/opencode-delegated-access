@@ -21,11 +21,11 @@
  * `parseVerdict` fails and the classification falls closed. Observed in
  * production as repeated `classifier: response did not parse` warnings.
  *
- * The `experimental.chat.system.transform` plugin hook receives the fully
- * assembled `system: string[]` for a prompt and lets us mutate it. For our
- * ephemeral classifier sessions ONLY, we replace the entire array with just
- * the classifier system prompt — stripping the polluting global context so
- * the classifier sees nothing but its own instructions.
+ * V2 assembles a separate request per request kind, so isolation must be
+ * registered per kind via {@link registerEphemeralIsolationHooks}. For our
+ * ephemeral classifier sessions ONLY, we replace the assembled system with
+ * just the classifier system prompt — stripping the polluting global context
+ * so the classifier sees nothing but its own instructions.
  */
 
 /**
@@ -54,26 +54,38 @@ export class EphemeralSystemRegistry {
   }
 }
 
-/**
- * Body of the `experimental.chat.system.transform` hook. If `input.sessionID`
- * is one of our registered ephemeral classifier sessions, replace the
- * assembled system array IN PLACE with only the registered classifier prompt.
- * Otherwise leave it untouched.
- *
- * Mutates `output.system` in place (same array reference) because opencode
- * may have captured the reference before invoking the hook.
- */
-export function applyEphemeralSystemTransform(
-  input: { sessionID?: string },
-  output: { system: string[] },
-  registry: EphemeralSystemRegistry,
-): void {
-  const sessionID = input.sessionID
-  if (!sessionID) return
-  const classifierPrompt = registry.get(sessionID)
-  if (classifierPrompt === undefined) return
+type V2SessionRequest = {
+  sessionID: string
+  system: Array<{ type: string; text: string }>
+  tools: Record<string, unknown>
+}
 
-  // Replace contents in place: clear, then push the single classifier prompt.
-  output.system.length = 0
-  output.system.push(classifierPrompt)
+type V2SessionHooks = {
+  hook(
+    name: "context" | "generate",
+    callback: (event: V2SessionRequest) => void,
+  ): Promise<unknown>
+}
+
+/** Isolate both request kinds the classifier path can produce: the agent-loop
+ * `context` request and the transient `generate` request issued by
+ * `session.generate`. Registering only `context` leaves the classifier prompt
+ * unapplied on the generate path (the 2026-09-16 fail-closed bug). */
+export async function registerEphemeralIsolationHooks(
+  session: V2SessionHooks,
+  sessionIDs: ReadonlySet<string>,
+  registry: EphemeralSystemRegistry,
+  onIsolated?: (sessionID: string) => void,
+): Promise<void> {
+  const isolate = (event: V2SessionRequest): void => {
+    if (!sessionIDs.has(event.sessionID)) return
+    const systemPrompt = registry.get(event.sessionID)
+    if (systemPrompt === undefined) return
+    event.system = [{ type: "text", text: systemPrompt }]
+    event.tools = {}
+    onIsolated?.(event.sessionID)
+  }
+
+  await session.hook("context", isolate)
+  await session.hook("generate", isolate)
 }
