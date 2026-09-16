@@ -4,13 +4,25 @@ import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { createLogger, defaultLogPath, LOG_SERVICE } from "./log.ts"
 
-/** Wait until the fire-and-forget append has landed in the file. */
-async function readLogLines(path: string): Promise<string[]> {
+/**
+ * Wait until the log file contains every `expected` substring, then return its
+ * contents. The logger appends fire-and-forget, so writes land asynchronously
+ * and in unspecified order — tests must not assume a line index or count.
+ */
+async function waitForLog(path: string, expected: string[]): Promise<string> {
   const { vi } = await import("vitest")
   await vi.waitFor(() => {
-    expect(readFileSync(path, "utf8").length).toBeGreaterThan(0)
+    const content = readFileSync(path, "utf8")
+    for (const needle of expected) {
+      expect(content).toContain(needle)
+    }
   })
-  return readFileSync(path, "utf8").trimEnd().split("\n")
+  return readFileSync(path, "utf8")
+}
+
+/** Non-empty lines, so a trailing newline isn't counted as a line. */
+function linesOf(content: string): string[] {
+  return content.split("\n").filter((line) => line.length > 0)
 }
 
 describe("createLogger", () => {
@@ -34,12 +46,15 @@ describe("createLogger", () => {
     log.warn("w-msg")
     log.error("e-msg")
 
-    const lines = await readLogLines(logPath)
-    expect(lines).toHaveLength(4)
-    expect(lines[0]).toContain(`[${LOG_SERVICE}] debug d-msg`)
-    expect(lines[1]).toContain(`[${LOG_SERVICE}] info i-msg`)
-    expect(lines[2]).toContain(`[${LOG_SERVICE}] warn w-msg`)
-    expect(lines[3]).toContain(`[${LOG_SERVICE}] error e-msg`)
+    const content = await waitForLog(logPath, [
+      `[${LOG_SERVICE}] debug d-msg`,
+      `[${LOG_SERVICE}] info i-msg`,
+      `[${LOG_SERVICE}] warn w-msg`,
+      `[${LOG_SERVICE}] error e-msg`,
+    ])
+
+    // One line per call — no accidental extra writes or merging.
+    expect(linesOf(content)).toHaveLength(4)
   })
 
   it("renders extra metadata as JSON on the same line", async () => {
@@ -47,24 +62,24 @@ describe("createLogger", () => {
 
     log.info("verdict parsed", { verdict: "SAFE", attempt: 1 })
 
-    const lines = await readLogLines(logPath)
-    expect(lines[0]).toContain('"verdict":"SAFE"')
-    expect(lines[0]).toContain('"attempt":1')
+    const content = await waitForLog(logPath, [
+      '"verdict":"SAFE"',
+      '"attempt":1',
+    ])
+
+    expect(linesOf(content)).toHaveLength(1)
+    expect(linesOf(content)[0]).toContain(`[${LOG_SERVICE}] info verdict parsed`)
   })
 
   it("keeps appending across calls rather than truncating", async () => {
     const log = createLogger(logPath)
 
     log.info("first")
-    await readLogLines(logPath)
+    await waitForLog(logPath, ["first"])
     log.info("second")
 
-    const { vi } = await import("vitest")
-    await vi.waitFor(async () => {
-      const content = readFileSync(logPath, "utf8")
-      expect(content).toContain("first")
-      expect(content).toContain("second")
-    })
+    const content = await waitForLog(logPath, ["first", "second"])
+    expect(linesOf(content)).toHaveLength(2)
   })
 
   it("never throws when the log path is unwritable", () => {

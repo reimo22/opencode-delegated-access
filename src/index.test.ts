@@ -91,7 +91,7 @@ type PendingSpec = {
   entry: {
     rootSessionID: string
     subject: string
-    subjectLabel: string
+    subjectLabel: "path" | "command"
     classifierVerdict: "SAFE" | "RISKY" | null
     classifierReason: string | null
     autoApproved: boolean
@@ -196,8 +196,8 @@ describe("DelegatedAccess setup — V2 hook registration", () => {
     expect(mockedHandle).toHaveBeenCalledTimes(1)
     expect(mockedHandle.mock.calls[0]?.[0]).toBe(ev)
     const ctx = mockedHandle.mock.calls[0]?.[1]
-    expect(typeof ctx.log.info).toBe("function")
-    expect(ctx.pendingSubjects).toBeDefined()
+    expect(typeof ctx!.log.info).toBe("function")
+    expect(ctx!.pendingSubjects).toBeDefined()
   })
 
   it("skips evaluations from its own ephemeral classifier sessions (loop guard)", async () => {
@@ -283,8 +283,8 @@ describe("repo context wiring", () => {
 
     const dual = await ctx!.getRepoContext!()
     expect(dual).not.toBeNull()
-    expect("pinned" in dual).toBe(true)
-    expect("current" in dual).toBe(true)
+    expect("pinned" in dual!).toBe(true)
+    expect("current" in dual!).toBe(true)
   })
 })
 

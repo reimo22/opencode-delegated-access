@@ -2,7 +2,8 @@ import { describe, it, expect, vi, beforeEach } from "vitest"
 
 vi.mock("../classifier/classify.ts", () => ({
   classifyCommand: vi.fn(),
-  classifySubject: vi.fn(),
+  // V2 routes external_directory through the directory classifier.
+  classifyDirectory: vi.fn(),
 }))
 // Only `getSessionMessages` is mocked (it's the only I/O call the handler
 // performs against the messages module). The pure extractors
@@ -15,9 +16,9 @@ vi.mock("../ui/messages.ts", async (importOriginal) => {
     getSessionMessages: vi.fn(),
   }
 })
-// `resolveRootSessionID` walks the session parent chain via the SDK; mock
-// it so handler tests control what "root" sessionID the handler sees
-// without having to stub session.get on the client object.
+// `resolveRootSessionID` walks the session parent chain via the V2 session
+// domain; mock it so handler tests control what "root" sessionID the handler
+// sees without having to stub session.get.
 vi.mock("../ui/session-tree.ts", () => ({
   resolveRootSessionID: vi.fn(),
 }))
@@ -37,8 +38,8 @@ vi.mock("./failure-notify.ts", async (importOriginal) => {
   }
 })
 
-import { classifyCommand, classifySubject } from "../classifier/classify.ts"
-import { getSessionMessages, type MessageEntry } from "../ui/messages.ts"
+import { classifyCommand, classifyDirectory } from "../classifier/classify.ts"
+import { getSessionMessages } from "../ui/messages.ts"
 import { resolveRootSessionID } from "../ui/session-tree.ts"
 import { runSafePath } from "./safe-path.ts"
 import { runRiskyPathInBackground } from "./risky-path.ts"
@@ -46,148 +47,57 @@ import {
   runFailureNotificationInBackground,
   FailureNotifyRateLimiter,
 } from "./failure-notify.ts"
-import { handlePermissionEvent } from "./handler.ts"
+import {
+  handlePermissionEvent,
+  evaluationKey,
+  type HandlerContext,
+  type PermissionEvaluation,
+} from "./handler.ts"
 import { EphemeralSystemRegistry } from "../classifier/ephemeral-system.ts"
 import { DirectoryVerdictCache } from "./directory-cache.ts"
-import { SafePathBatcher } from "./safe-path-batcher.ts"
 import { ApprovalHistoryStore } from "./approval-history.ts"
 import { PendingSubjectsMap } from "./pending-subjects.ts"
-import { DEFAULT_CONFIG } from "../config.ts"
+import { parseConfig, type DelegatedAccessConfig } from "../config.ts"
+import {
+  makeHandlerContext,
+  makeEvaluation,
+  userMessage,
+  assistantMessage,
+  SAMPLE_MODEL,
+} from "../testing/v2-fixtures.ts"
 
 const mockedClassify = vi.mocked(classifyCommand)
-const mockedClassifySubject = vi.mocked(classifySubject)
+const mockedClassifyDirectory = vi.mocked(classifyDirectory)
 const mockedGetSessionMessages = vi.mocked(getSessionMessages)
 const mockedResolveRoot = vi.mocked(resolveRootSessionID)
 const mockedSafe = vi.mocked(runSafePath)
 const mockedRisky = vi.mocked(runRiskyPathInBackground)
 const mockedFailureNotify = vi.mocked(runFailureNotificationInBackground)
 
-/** Minimal synthetic entry helpers for handler tests. */
-function userEntry(text: string): MessageEntry {
-  return {
-    info: {
-      id: `u_${text}`,
-      sessionID: "sess_test",
-      role: "user",
-      time: { created: 0 },
-    } as MessageEntry["info"],
-    parts: [
-      {
-        id: `p_${text}`,
-        sessionID: "sess_test",
-        messageID: `u_${text}`,
-        type: "text",
-        text,
-      } as MessageEntry["parts"][number],
-    ],
-  }
-}
-
-function assistantEntryWithModel(
-  providerID: string,
-  modelID: string,
-): MessageEntry {
-  return {
-    info: {
-      id: `a_${modelID}`,
-      sessionID: "sess_test",
-      role: "assistant",
-      time: { created: 0 },
-      providerID,
-      modelID,
-    } as unknown as MessageEntry["info"],
-    parts: [],
-  }
+/** Options for the local ctx builder: HandlerContext overrides plus a partial
+ * config, so tests can flip individual config flags without rebuilding the
+ * whole config object. */
+type BuildCtxOptions = Partial<Omit<HandlerContext, "config">> & {
+  config?: Partial<DelegatedAccessConfig>
 }
 
 /**
- * Build a ctx whose client records calls to the permission-respond endpoint.
- * Returns both the ctx and the recorded calls so tests can assert on them.
+ * Build a V2 HandlerContext on top of the shared fixtures. Defaults
+ * `sessionModel` to a usable model so classification proceeds unless a test
+ * explicitly passes `sessionModel: undefined`.
  */
-function buildCtx(overrides: Partial<{
-  enabled: boolean
-  contextMessageCount: number
-  classifierModel: string
-  sessionModel: { providerID: string; modelID: string } | undefined
-  respondImpl: (opts: unknown) => Promise<unknown>
-  getRepoContext: () => Promise<unknown> | unknown
-  approvalHistory: ApprovalHistoryStore
-  pendingSubjects: PendingSubjectsMap
-  approvalHistoryEnabled: boolean
-  approvalHistoryMax: number
-  notifyOnClassifierFailure: boolean
-  failureNotifyRateLimiter: FailureNotifyRateLimiter
-  ephemeralSystemRegistry: EphemeralSystemRegistry
-}> = {}) {
-  const respondCall = vi.fn(
-    overrides.respondImpl ?? (async () => ({ data: true } as unknown)),
-  )
-  const log = {
-    debug: vi.fn(),
-    info: vi.fn(),
-    warn: vi.fn(),
-    error: vi.fn(),
-  }
-  const ctx = {
-    client: {
-      postSessionIdPermissionsPermissionId: respondCall,
-    } as never,
-    config: {
-      ...DEFAULT_CONFIG,
-      ...(overrides.enabled !== undefined ? { enabled: overrides.enabled } : {}),
-      ...(overrides.contextMessageCount !== undefined
-        ? { contextMessageCount: overrides.contextMessageCount }
-        : {}),
-      ...(overrides.classifierModel !== undefined
-        ? { classifierModel: overrides.classifierModel }
-        : {}),
-      ...(overrides.approvalHistoryEnabled !== undefined
-        ? { approvalHistoryEnabled: overrides.approvalHistoryEnabled }
-        : {}),
-      ...(overrides.approvalHistoryMax !== undefined
-        ? { approvalHistoryMax: overrides.approvalHistoryMax }
-        : {}),
-      ...(overrides.notifyOnClassifierFailure !== undefined
-        ? { notifyOnClassifierFailure: overrides.notifyOnClassifierFailure }
-        : {}),
-    },
-    sessionModel:
-      "sessionModel" in overrides
-        ? overrides.sessionModel
-        : { providerID: "anthropic", modelID: "claude-sonnet-4-5" },
-    ephemeralSessionIDs: new Set<string>(),
-    directoryVerdictCache: new DirectoryVerdictCache(),
-    approvalHistory: overrides.approvalHistory ?? new ApprovalHistoryStore(),
-    pendingSubjects: overrides.pendingSubjects ?? new PendingSubjectsMap(),
-    safePathBatcher: new SafePathBatcher({
-      batchWindowMs: 0, // flush immediately in tests (runSafePath is mocked anyway)
-      sendNotification: async () => ({ type: "timeout" as const }),
-      countdownMs: DEFAULT_CONFIG.safeCountdownMs,
-      sound: false,
-    }),
-    failureNotifyRateLimiter:
-      overrides.failureNotifyRateLimiter ??
-      new FailureNotifyRateLimiter({
-        cooldownMs: DEFAULT_CONFIG.classifierFailureNotifyCooldownMs,
-      }),
-    ...(overrides.ephemeralSystemRegistry !== undefined
-      ? { ephemeralSystemRegistry: overrides.ephemeralSystemRegistry }
-      : {}),
-    log,
-    ...(overrides.getRepoContext !== undefined
-      ? {
-          getRepoContext: overrides.getRepoContext as () => Promise<
-            ReturnType<typeof Object> | null
-          >,
-        }
-      : {}),
-  } as unknown as Parameters<typeof handlePermissionEvent>[1]
-  return { ctx, respondCall, log }
+function buildCtx(overrides: BuildCtxOptions = {}): HandlerContext {
+  const { config, ...rest } = overrides
+  return makeHandlerContext({
+    sessionModel: SAMPLE_MODEL,
+    ...rest,
+    ...(config ? { config: { ...parseConfig(undefined), ...config } } : {}),
+  })
 }
 
 beforeEach(() => {
   mockedClassify.mockReset()
-  mockedClassifySubject.mockReset()
+  mockedClassifyDirectory.mockReset()
   mockedGetSessionMessages.mockReset()
   mockedResolveRoot.mockReset()
   mockedSafe.mockReset()
@@ -196,75 +106,60 @@ beforeEach(() => {
   mockedFailureNotify.mockResolvedValue(undefined)
   // Default: one user message, no assistant messages. Tests that need
   // assistant-model fallback override this with their own value.
-  mockedGetSessionMessages.mockResolvedValue([
-    userEntry("please check the repo"),
-  ])
+  mockedGetSessionMessages.mockResolvedValue([userMessage("please check the repo")])
   // Default: treat the permission's own sessionID as the root (i.e. not
   // a subagent). Subagent tests override this to return a different
   // sessionID. Fail-closed tests override it to return null.
-  mockedResolveRoot.mockImplementation(async (_client, sessionID) => sessionID)
+  mockedResolveRoot.mockImplementation(async (_session, sessionID) => sessionID)
 })
-
-function basePermission(overrides: Record<string, unknown> = {}) {
-  return {
-    id: "perm_123",
-    type: "bash",
-    pattern: "git status",
-    sessionID: "sess_abc",
-    messageID: "msg_xyz",
-    title: "Run bash command",
-    metadata: {},
-    time: { created: 0 },
-    ...overrides,
-  } as never
-}
 
 describe("handlePermissionEvent", () => {
   it("does nothing when config.enabled is false", async () => {
-    const { ctx, respondCall } = buildCtx({ enabled: false })
-    await handlePermissionEvent(basePermission(), ctx)
+    const ctx = buildCtx({ config: { enabled: false } })
+    const ev = makeEvaluation()
+    await handlePermissionEvent(ev, ctx)
     expect(mockedClassify).not.toHaveBeenCalled()
-    expect(respondCall).not.toHaveBeenCalled()
+    expect(ev.effect).toBe("ask")
   })
 
-  it("does nothing for non-bash tool types", async () => {
-    const { ctx, respondCall } = buildCtx()
-    await handlePermissionEvent(basePermission({ type: "edit" }), ctx)
+  it("does nothing for non-shell permission actions", async () => {
+    const ctx = buildCtx()
+    const ev = makeEvaluation({ action: "edit" })
+    await handlePermissionEvent(ev, ctx)
     expect(mockedClassify).not.toHaveBeenCalled()
-    expect(respondCall).not.toHaveBeenCalled()
+    expect(ev.effect).toBe("ask")
   })
 
-  it("calls the SDK with response='once' when SAFE and safe-path returns allow", async () => {
+  it("sets ev.effect='allow' when SAFE and safe-path returns allow (no SDK reply)", async () => {
     mockedClassify.mockResolvedValueOnce({
       verdict: "SAFE",
       reason: "read-only",
     })
     mockedSafe.mockResolvedValueOnce("allow")
 
-    const { ctx, respondCall } = buildCtx()
-    await handlePermissionEvent(basePermission(), ctx)
+    const ctx = buildCtx()
+    const ev = makeEvaluation()
+    await handlePermissionEvent(ev, ctx)
 
-    expect(respondCall).toHaveBeenCalledTimes(1)
-    const args = respondCall.mock.calls[0]?.[0] as {
-      path: { id: string; permissionID: string }
-      body: { response: string }
-    }
-    expect(args.path).toEqual({ id: "sess_abc", permissionID: "perm_123" })
-    expect(args.body.response).toBe("once")
+    // V2: auto-approval happens by mutating `ev.effect` BEFORE opencode
+    // creates its TUI prompt — the handler never calls the SDK reply itself.
+    expect(ev.effect).toBe("allow")
+    expect(ctx.opencode.permission.reply).not.toHaveBeenCalled()
     expect(mockedRisky).not.toHaveBeenCalled()
   })
 
-  it("does NOT call the SDK when SAFE but user cancels (safe-path returns ask)", async () => {
+  it("leaves ev.effect='ask' when SAFE but user cancels (safe-path returns ask)", async () => {
     mockedClassify.mockResolvedValueOnce({
       verdict: "SAFE",
       reason: "read-only",
     })
     mockedSafe.mockResolvedValueOnce("ask")
 
-    const { ctx, respondCall } = buildCtx()
-    await handlePermissionEvent(basePermission(), ctx)
+    const ctx = buildCtx()
+    const ev = makeEvaluation()
+    await handlePermissionEvent(ev, ctx)
 
-    expect(respondCall).not.toHaveBeenCalled()
+    expect(ev.effect).toBe("ask")
   })
 
   it("starts the risky-path in background when verdict is RISKY", async () => {
@@ -272,33 +167,59 @@ describe("handlePermissionEvent", () => {
       verdict: "RISKY",
       reason: "destructive",
     })
-    mockedRisky.mockResolvedValue(undefined)
 
-    const { ctx, respondCall } = buildCtx()
-    await handlePermissionEvent(
-      basePermission({ pattern: "rm -rf /" }),
-      ctx,
-    )
+    const ctx = buildCtx()
+    const ev = makeEvaluation({ resources: ["rm -rf /"] })
+    await handlePermissionEvent(ev, ctx)
 
-    // We don't call the SDK directly in the RISKY path; the risky-path
-    // function calls it on button click.
-    expect(respondCall).not.toHaveBeenCalled()
+    // V2: the TUI prompt is left in place; the risky-path gets an injected
+    // replier it can call on a notification-button click.
+    expect(ev.effect).toBe("ask")
     expect(mockedRisky).toHaveBeenCalledTimes(1)
     const args = mockedRisky.mock.calls[0]?.[0]
-    expect(args?.sessionID).toBe("sess_abc")
-    expect(args?.permissionID).toBe("perm_123")
     expect(args?.command).toBe("rm -rf /")
     expect(args?.reason).toBe("destructive")
+    expect(typeof args?.reply).toBe("function")
+  })
+
+  it("resolves the pending request via the injected reply (RISKY path)", async () => {
+    mockedClassify.mockResolvedValueOnce({
+      verdict: "RISKY",
+      reason: "destructive",
+    })
+
+    const ctx = buildCtx()
+    vi.mocked(ctx.opencode.permission.list).mockResolvedValue([
+      {
+        id: "req_1",
+        sessionID: "sess_root",
+        action: "shell",
+        resources: ["rm -rf /"],
+      },
+    ])
+    const ev = makeEvaluation({ resources: ["rm -rf /"] })
+    await handlePermissionEvent(ev, ctx)
+
+    const reply = mockedRisky.mock.calls[0]?.[0]?.reply
+    expect(reply).toBeTypeOf("function")
+    await reply!("once")
+
+    expect(ctx.opencode.permission.reply).toHaveBeenCalledWith({
+      sessionID: "sess_root",
+      requestID: "req_1",
+      reply: "once",
+    })
   })
 
   it("does not auto-resolve when the classifier fails (returns null)", async () => {
     mockedClassify.mockResolvedValueOnce(null)
 
-    const { ctx, respondCall } = buildCtx()
-    await handlePermissionEvent(basePermission(), ctx)
+    const ctx = buildCtx()
+    const ev = makeEvaluation()
+    await handlePermissionEvent(ev, ctx)
 
     // The plugin must never auto-approve/auto-reject on a classifier failure.
-    expect(respondCall).not.toHaveBeenCalled()
+    expect(ev.effect).toBe("ask")
     expect(mockedSafe).not.toHaveBeenCalled()
     expect(mockedRisky).not.toHaveBeenCalled()
   })
@@ -306,23 +227,50 @@ describe("handlePermissionEvent", () => {
   it("fires the failure notification when the classifier returns null", async () => {
     mockedClassify.mockResolvedValueOnce(null)
 
-    const { ctx } = buildCtx()
-    await handlePermissionEvent(basePermission({ pattern: "echo hi" }), ctx)
+    const ctx = buildCtx()
+    const ev = makeEvaluation({ resources: ["echo hi"] })
+    await handlePermissionEvent(ev, ctx)
 
     expect(mockedFailureNotify).toHaveBeenCalledTimes(1)
     const args = mockedFailureNotify.mock.calls[0]?.[0]
-    expect(args?.permissionID).toBe("perm_123")
     expect(args?.command).toBe("echo hi")
     // Failure class defaults to "error" when the classifier mock doesn't
     // invoke onFailure; the real classifier reports "timeout" vs "error".
     expect(["timeout", "error"]).toContain(args?.failureClass)
+    expect(typeof args?.reply).toBe("function")
+  })
+
+  it("resolves the pending request via the injected reply (classifier-failure path)", async () => {
+    mockedClassify.mockResolvedValueOnce(null)
+
+    const ctx = buildCtx()
+    vi.mocked(ctx.opencode.permission.list).mockResolvedValue([
+      {
+        id: "req_2",
+        sessionID: "sess_root",
+        action: "shell",
+        resources: ["echo hi"],
+      },
+    ])
+    const ev = makeEvaluation({ resources: ["echo hi"] })
+    await handlePermissionEvent(ev, ctx)
+
+    const reply = mockedFailureNotify.mock.calls[0]?.[0]?.reply
+    expect(reply).toBeTypeOf("function")
+    await reply!("reject")
+
+    expect(ctx.opencode.permission.reply).toHaveBeenCalledWith({
+      sessionID: "sess_root",
+      requestID: "req_2",
+      reply: "reject",
+    })
   })
 
   it("does NOT fire the failure notification when notifyOnClassifierFailure is false", async () => {
     mockedClassify.mockResolvedValueOnce(null)
 
-    const { ctx } = buildCtx({ notifyOnClassifierFailure: false })
-    await handlePermissionEvent(basePermission(), ctx)
+    const ctx = buildCtx({ config: { notifyOnClassifierFailure: false } })
+    await handlePermissionEvent(makeEvaluation(), ctx)
 
     expect(mockedFailureNotify).not.toHaveBeenCalled()
   })
@@ -331,8 +279,8 @@ describe("handlePermissionEvent", () => {
     mockedClassify.mockResolvedValueOnce({ verdict: "SAFE", reason: "r" })
     mockedSafe.mockResolvedValueOnce("allow")
 
-    const { ctx } = buildCtx()
-    await handlePermissionEvent(basePermission(), ctx)
+    const ctx = buildCtx()
+    await handlePermissionEvent(makeEvaluation(), ctx)
 
     expect(mockedFailureNotify).not.toHaveBeenCalled()
   })
@@ -342,10 +290,19 @@ describe("handlePermissionEvent", () => {
     const rl = new FailureNotifyRateLimiter({ cooldownMs: 60_000 })
     mockedClassify.mockResolvedValue(null)
 
-    const { ctx } = buildCtx({ failureNotifyRateLimiter: rl })
-    await handlePermissionEvent(basePermission({ id: "p1" }), ctx)
-    await handlePermissionEvent(basePermission({ id: "p2" }), ctx)
-    await handlePermissionEvent(basePermission({ id: "p3" }), ctx)
+    const ctx = buildCtx({ failureNotifyRateLimiter: rl })
+    await handlePermissionEvent(
+      makeEvaluation({ sessionID: "sess_1", resources: ["echo 1"] }),
+      ctx,
+    )
+    await handlePermissionEvent(
+      makeEvaluation({ sessionID: "sess_2", resources: ["echo 2"] }),
+      ctx,
+    )
+    await handlePermissionEvent(
+      makeEvaluation({ sessionID: "sess_3", resources: ["echo 3"] }),
+      ctx,
+    )
 
     // Only the first failure in the window actually notifies.
     expect(mockedFailureNotify).toHaveBeenCalledTimes(1)
@@ -354,23 +311,24 @@ describe("handlePermissionEvent", () => {
   it("does nothing when getSessionMessages throws", async () => {
     mockedGetSessionMessages.mockRejectedValueOnce(new Error("sdk explode"))
 
-    const { ctx, respondCall } = buildCtx()
-    await handlePermissionEvent(basePermission(), ctx)
+    const ctx = buildCtx()
+    const ev = makeEvaluation()
+    await handlePermissionEvent(ev, ctx)
 
     expect(mockedClassify).not.toHaveBeenCalled()
-    expect(respondCall).not.toHaveBeenCalled()
+    expect(ev.effect).toBe("ask")
   })
 
-  it("extracts command from a string pattern", async () => {
+  it("extracts the command from the resources array", async () => {
     mockedClassify.mockResolvedValueOnce({
       verdict: "SAFE",
       reason: "r",
     })
     mockedSafe.mockResolvedValueOnce("allow")
 
-    const { ctx } = buildCtx()
+    const ctx = buildCtx()
     await handlePermissionEvent(
-      basePermission({ pattern: "echo hi" }),
+      makeEvaluation({ resources: ["echo hi"] }),
       ctx,
     )
 
@@ -379,19 +337,20 @@ describe("handlePermissionEvent", () => {
   })
 
   it("classifies the FULL compound command, not just the first sub-command", async () => {
-    // opencode 1.15.x splits a compound shell command (joined by &&, ;, |,
-    // etc.) into its constituent sub-commands in `patterns`. Classifying only
-    // patterns[0] would judge a different, often safer command than what
-    // actually runs — a safe first segment could mask a risky later one.
+    // The V2 permission scanner splits a compound shell command (joined by
+    // &&, ;, |, etc.) into its constituent sub-commands in `resources`.
+    // Classifying only resources[0] would judge a different, often safer
+    // command than what actually runs — a safe first segment could mask a
+    // risky later one.
     mockedClassify.mockResolvedValueOnce({
       verdict: "SAFE",
       reason: "r",
     })
     mockedSafe.mockResolvedValueOnce("allow")
 
-    const { ctx } = buildCtx()
+    const ctx = buildCtx()
     await handlePermissionEvent(
-      basePermission({ pattern: ["git add .", 'git commit -m "wip"'] }),
+      makeEvaluation({ resources: ["git add .", 'git commit -m "wip"'] }),
       ctx,
     )
 
@@ -407,9 +366,9 @@ describe("handlePermissionEvent", () => {
       reason: "r",
     })
 
-    const { ctx } = buildCtx()
+    const ctx = buildCtx()
     await handlePermissionEvent(
-      basePermission({ pattern: ["git status", "rm -rf /important"] }),
+      makeEvaluation({ resources: ["git status", "rm -rf /important"] }),
       ctx,
     )
 
@@ -418,16 +377,16 @@ describe("handlePermissionEvent", () => {
     expect(args?.command).toContain("rm -rf /important")
   })
 
-  it("classifies a single-element array pattern as just that command", async () => {
+  it("classifies a single-element resources array as just that command", async () => {
     mockedClassify.mockResolvedValueOnce({
       verdict: "SAFE",
       reason: "r",
     })
     mockedSafe.mockResolvedValueOnce("allow")
 
-    const { ctx } = buildCtx()
+    const ctx = buildCtx()
     await handlePermissionEvent(
-      basePermission({ pattern: ["ls -la"] }),
+      makeEvaluation({ resources: ["ls -la"] }),
       ctx,
     )
 
@@ -435,14 +394,12 @@ describe("handlePermissionEvent", () => {
     expect(args?.command).toBe("ls -la")
   })
 
-  it("does nothing when pattern is missing (no command to classify)", async () => {
-    const { ctx, respondCall } = buildCtx()
-    await handlePermissionEvent(
-      basePermission({ pattern: undefined }),
-      ctx,
-    )
+  it("does nothing when resources is empty (no command to classify)", async () => {
+    const ctx = buildCtx()
+    const ev = makeEvaluation({ resources: [] })
+    await handlePermissionEvent(ev, ctx)
     expect(mockedClassify).not.toHaveBeenCalled()
-    expect(respondCall).not.toHaveBeenCalled()
+    expect(ev.effect).toBe("ask")
   })
 
   it("applies config.contextMessageCount when extracting user messages", async () => {
@@ -452,15 +409,15 @@ describe("handlePermissionEvent", () => {
     // 5 user messages available; contextMessageCount=2 → classifier sees
     // only the last 2.
     mockedGetSessionMessages.mockResolvedValueOnce([
-      userEntry("m1"),
-      userEntry("m2"),
-      userEntry("m3"),
-      userEntry("m4"),
-      userEntry("m5"),
+      userMessage("m1"),
+      userMessage("m2"),
+      userMessage("m3"),
+      userMessage("m4"),
+      userMessage("m5"),
     ])
 
-    const { ctx } = buildCtx({ contextMessageCount: 2 })
-    await handlePermissionEvent(basePermission(), ctx)
+    const ctx = buildCtx({ config: { contextMessageCount: 2 } })
+    await handlePermissionEvent(makeEvaluation(), ctx)
 
     const classifyArgs = mockedClassify.mock.calls[0]?.[0]
     expect(classifyArgs?.userMessages).toEqual(["m4", "m5"])
@@ -470,10 +427,10 @@ describe("handlePermissionEvent", () => {
     mockedClassify.mockResolvedValueOnce({ verdict: "SAFE", reason: "r" })
     mockedSafe.mockResolvedValueOnce("allow")
 
-    const { ctx } = buildCtx({
-      classifierModel: "anthropic/claude-haiku-4-5",
+    const ctx = buildCtx({
+      config: { classifierModel: "anthropic/claude-haiku-4-5" },
     })
-    await handlePermissionEvent(basePermission(), ctx)
+    await handlePermissionEvent(makeEvaluation(), ctx)
 
     const args = mockedClassify.mock.calls[0]?.[0]
     expect(args?.model).toEqual({
@@ -486,19 +443,19 @@ describe("handlePermissionEvent", () => {
     mockedClassify.mockResolvedValueOnce({ verdict: "SAFE", reason: "r" })
     mockedSafe.mockResolvedValueOnce("allow")
 
-    const { ctx, log } = buildCtx()
-    await handlePermissionEvent(basePermission(), ctx)
+    const ctx = buildCtx()
+    await handlePermissionEvent(makeEvaluation(), ctx)
 
     const args = mockedClassify.mock.calls[0]?.[0]
-    expect(args?.log).toBe(log)
+    expect(args?.log).toBe(ctx.log)
   })
 
   it("forwards config.classifierRetries to the classifier", async () => {
     mockedClassify.mockResolvedValueOnce({ verdict: "SAFE", reason: "r" })
     mockedSafe.mockResolvedValueOnce("allow")
 
-    const { ctx } = buildCtx()
-    await handlePermissionEvent(basePermission(), ctx)
+    const ctx = buildCtx()
+    await handlePermissionEvent(makeEvaluation(), ctx)
 
     const args = mockedClassify.mock.calls[0]?.[0]
     // DEFAULT_CONFIG.classifierRetries is 1.
@@ -510,8 +467,8 @@ describe("handlePermissionEvent", () => {
     mockedSafe.mockResolvedValueOnce("allow")
 
     const registry = new EphemeralSystemRegistry()
-    const { ctx } = buildCtx({ ephemeralSystemRegistry: registry })
-    await handlePermissionEvent(basePermission(), ctx)
+    const ctx = buildCtx({ ephemeralSystemRegistry: registry })
+    await handlePermissionEvent(makeEvaluation(), ctx)
 
     // The handler must wire onEphemeralSessionCreated so that (id, prompt)
     // lands in the registry. Simulate the classifier invoking the callback.
@@ -526,8 +483,8 @@ describe("handlePermissionEvent", () => {
     mockedSafe.mockResolvedValueOnce("allow")
 
     const registry = new EphemeralSystemRegistry()
-    const { ctx } = buildCtx({ ephemeralSystemRegistry: registry })
-    await handlePermissionEvent(basePermission(), ctx)
+    const ctx = buildCtx({ ephemeralSystemRegistry: registry })
+    await handlePermissionEvent(makeEvaluation(), ctx)
 
     const call = mockedClassify.mock.calls[0]?.[0]
     call?.onEphemeralSessionCreated?.("sess_eph_test", "P")
@@ -537,21 +494,22 @@ describe("handlePermissionEvent", () => {
   })
 
   it("does nothing when no classifier model can be resolved", async () => {
-    const { ctx, respondCall } = buildCtx({
+    const ctx = buildCtx({
       sessionModel: undefined,
-      classifierModel: undefined as unknown as string,
+      config: { classifierModel: undefined },
     })
-    await handlePermissionEvent(basePermission(), ctx)
+    const ev = makeEvaluation()
+    await handlePermissionEvent(ev, ctx)
     expect(mockedClassify).not.toHaveBeenCalled()
-    expect(respondCall).not.toHaveBeenCalled()
+    expect(ev.effect).toBe("ask")
   })
 
   it("passes the loop-guard callbacks to classifyCommand", async () => {
     mockedClassify.mockResolvedValueOnce({ verdict: "SAFE", reason: "r" })
     mockedSafe.mockResolvedValueOnce("allow")
 
-    const { ctx } = buildCtx()
-    await handlePermissionEvent(basePermission(), ctx)
+    const ctx = buildCtx()
+    await handlePermissionEvent(makeEvaluation(), ctx)
 
     const args = mockedClassify.mock.calls[0]?.[0]
     expect(typeof args?.onEphemeralSessionCreated).toBe("function")
@@ -564,200 +522,80 @@ describe("handlePermissionEvent", () => {
     expect(ctx.ephemeralSessionIDs.has("sess_eph_abc")).toBe(false)
   })
 
-  it("swallows SDK respond errors (TUI prompt remains as fallback)", async () => {
+  it("injected reply is fail-closed when permission.list throws (TUI prompt remains)", async () => {
+    // V2 SAFE path no longer calls the SDK reply; the only SDK interaction is
+    // through the replier injected into the risky/failure paths. That replier
+    // must never throw: any lookup failure leaves the TUI prompt in place.
     mockedClassify.mockResolvedValueOnce({
-      verdict: "SAFE",
+      verdict: "RISKY",
       reason: "r",
     })
-    mockedSafe.mockResolvedValueOnce("allow")
 
-    const { ctx, respondCall } = buildCtx({
-      respondImpl: async () => {
-        throw new Error("sdk boom")
-      },
-    })
+    const ctx = buildCtx()
+    vi.mocked(ctx.opencode.permission.list).mockRejectedValue(
+      new Error("sdk boom"),
+    )
+    const ev = makeEvaluation()
+    await handlePermissionEvent(ev, ctx)
 
-    // Should not throw.
-    await expect(
-      handlePermissionEvent(basePermission(), ctx),
-    ).resolves.toBeUndefined()
-    expect(respondCall).toHaveBeenCalledTimes(1)
+    const reply = mockedRisky.mock.calls[0]?.[0]?.reply
+    expect(reply).toBeTypeOf("function")
+    await expect(reply!("once")).resolves.toBeUndefined()
+    expect(ctx.opencode.permission.reply).not.toHaveBeenCalled()
+    expect(ev.effect).toBe("ask")
   })
 
-  // --- pre-ask interception path (permission.ask hook with output) -------
+  // --- V2 evaluate-hook effect (set before the TUI prompt exists) --------
 
-  it("when output is provided and verdict is SAFE-allow, sets output.status='allow' instead of calling SDK", async () => {
+  it("sets ev.effect='allow' on a SAFE-allow verdict without replying to the SDK", async () => {
     mockedClassify.mockResolvedValueOnce({ verdict: "SAFE", reason: "r" })
     mockedSafe.mockResolvedValueOnce("allow")
 
-    const { ctx, respondCall } = buildCtx()
-    const output = { status: "ask" as "ask" | "allow" | "deny" }
-    await handlePermissionEvent(basePermission(), ctx, {
-      hookName: "permission.ask",
-      output,
-    })
+    const ctx = buildCtx()
+    const ev = makeEvaluation()
+    await handlePermissionEvent(ev, ctx)
 
-    expect(output.status).toBe("allow")
-    expect(respondCall).not.toHaveBeenCalled()
+    expect(ev.effect).toBe("allow")
+    expect(ctx.opencode.permission.reply).not.toHaveBeenCalled()
   })
 
-  it("when output is provided and verdict is SAFE but user cancels, leaves output.status='ask'", async () => {
+  it("leaves ev.effect='ask' on a SAFE verdict when the user cancels", async () => {
     mockedClassify.mockResolvedValueOnce({ verdict: "SAFE", reason: "r" })
     mockedSafe.mockResolvedValueOnce("ask")
 
-    const { ctx, respondCall } = buildCtx()
-    const output = { status: "ask" as "ask" | "allow" | "deny" }
-    await handlePermissionEvent(basePermission(), ctx, {
-      hookName: "permission.ask",
-      output,
-    })
+    const ctx = buildCtx()
+    const ev = makeEvaluation()
+    await handlePermissionEvent(ev, ctx)
 
-    expect(output.status).toBe("ask")
-    expect(respondCall).not.toHaveBeenCalled()
+    expect(ev.effect).toBe("ask")
+    expect(ctx.opencode.permission.reply).not.toHaveBeenCalled()
   })
 
-  it("when output is provided and verdict is RISKY, leaves output.status='ask' and kicks off risky path", async () => {
+  it("leaves ev.effect='ask' on a RISKY verdict and kicks off the risky path", async () => {
     mockedClassify.mockResolvedValueOnce({
       verdict: "RISKY",
       reason: "destructive",
     })
-    mockedRisky.mockResolvedValue(undefined)
 
-    const { ctx, respondCall } = buildCtx()
-    const output = { status: "ask" as "ask" | "allow" | "deny" }
-    await handlePermissionEvent(
-      basePermission({ pattern: "rm -rf /" }),
-      ctx,
-      { hookName: "permission.ask", output },
-    )
+    const ctx = buildCtx()
+    const ev = makeEvaluation({ resources: ["rm -rf /"] })
+    await handlePermissionEvent(ev, ctx)
 
     // TUI prompt should still be shown; notification runs alongside.
-    expect(output.status).toBe("ask")
+    expect(ev.effect).toBe("ask")
     expect(mockedRisky).toHaveBeenCalledTimes(1)
-    expect(respondCall).not.toHaveBeenCalled()
+    expect(ctx.opencode.permission.reply).not.toHaveBeenCalled()
   })
 
-  it("when output is provided and classifier fails, leaves output.status='ask' (fail closed)", async () => {
+  it("leaves ev.effect='ask' when the classifier fails (fail closed)", async () => {
     mockedClassify.mockResolvedValueOnce(null)
 
-    const { ctx, respondCall } = buildCtx()
-    const output = { status: "ask" as "ask" | "allow" | "deny" }
-    await handlePermissionEvent(basePermission(), ctx, {
-      hookName: "permission.ask",
-      output,
-    })
+    const ctx = buildCtx()
+    const ev = makeEvaluation()
+    await handlePermissionEvent(ev, ctx)
 
-    expect(output.status).toBe("ask")
-    expect(respondCall).not.toHaveBeenCalled()
-  })
-
-  it("calls SDK when output is NOT provided (permission.updated / event paths)", async () => {
-    mockedClassify.mockResolvedValueOnce({ verdict: "SAFE", reason: "r" })
-    mockedSafe.mockResolvedValueOnce("allow")
-
-    const { ctx, respondCall } = buildCtx()
-    await handlePermissionEvent(basePermission(), ctx, {
-      hookName: "permission.updated",
-    })
-
-    expect(respondCall).toHaveBeenCalledTimes(1)
-  })
-
-  // --- runtime-shape adapter --------------------------------------------
-  //
-  // The opencode 1.4.x event stream emits permissions with field names
-  // `permission` (tool type) and `patterns` (string[]), different from the
-  // SDK-typed Permission's `type` / `pattern`. The handler must accept
-  // both.
-
-  it("accepts runtime-shape permission ({ permission, patterns })", async () => {
-    mockedClassify.mockResolvedValueOnce({ verdict: "SAFE", reason: "r" })
-    mockedSafe.mockResolvedValueOnce("allow")
-
-    const { ctx, respondCall } = buildCtx()
-    // Shape as opencode actually emits on 1.4.x: `permission` (not `type`)
-    // and `patterns` (array, not `pattern`).
-    const runtime = {
-      id: "per_runtime",
-      permission: "bash",
-      patterns: ["uname -a"],
-      sessionID: "sess_rt",
-      messageID: "msg_rt",
-      title: "Run bash command",
-      metadata: {},
-      time: { created: 0 },
-    } as never
-
-    await handlePermissionEvent(runtime, ctx)
-
-    expect(mockedClassify).toHaveBeenCalledTimes(1)
-    const classifyArgs = mockedClassify.mock.calls[0]?.[0]
-    expect(classifyArgs?.command).toBe("uname -a")
-    expect(respondCall).toHaveBeenCalledTimes(1)
-  })
-
-  it("skips runtime-shape permission with a non-bash `permission` value", async () => {
-    const { ctx, respondCall } = buildCtx()
-    const runtime = {
-      id: "per_runtime_task",
-      permission: "task",
-      patterns: ["committer"],
-      sessionID: "sess_rt",
-      messageID: "msg_rt",
-      title: "Launch subagent",
-      metadata: {},
-      time: { created: 0 },
-    } as never
-
-    await handlePermissionEvent(runtime, ctx)
-
-    expect(mockedClassify).not.toHaveBeenCalled()
-    expect(respondCall).not.toHaveBeenCalled()
-  })
-
-  it("skips runtime-shape permission when `patterns` is empty", async () => {
-    const { ctx, respondCall } = buildCtx()
-    const runtime = {
-      id: "per_runtime_empty",
-      permission: "bash",
-      patterns: [],
-      sessionID: "sess_rt",
-      messageID: "msg_rt",
-      title: "Run bash command",
-      metadata: {},
-      time: { created: 0 },
-    } as never
-
-    await handlePermissionEvent(runtime, ctx)
-
-    expect(mockedClassify).not.toHaveBeenCalled()
-    expect(respondCall).not.toHaveBeenCalled()
-  })
-
-  it("prefers runtime-shape fields over SDK-typed fields when both present", async () => {
-    mockedClassify.mockResolvedValueOnce({ verdict: "SAFE", reason: "r" })
-    mockedSafe.mockResolvedValueOnce("allow")
-
-    const { ctx } = buildCtx()
-    // Hybrid input: both shapes present. Runtime names should win.
-    const hybrid = {
-      id: "per_hybrid",
-      type: "task", // SDK-typed: would be skipped as non-bash
-      pattern: "wrong command", // SDK-typed
-      permission: "bash", // runtime: should win, passes bash check
-      patterns: ["ls -la"], // runtime: should win, extract this command
-      sessionID: "sess_rt",
-      messageID: "msg_rt",
-      title: "Run bash command",
-      metadata: {},
-      time: { created: 0 },
-    } as never
-
-    await handlePermissionEvent(hybrid, ctx)
-
-    expect(mockedClassify).toHaveBeenCalledTimes(1)
-    const classifyArgs = mockedClassify.mock.calls[0]?.[0]
-    expect(classifyArgs?.command).toBe("ls -la")
+    expect(ev.effect).toBe("ask")
+    expect(ctx.opencode.permission.reply).not.toHaveBeenCalled()
   })
 
   // --- session-model fallback from latest assistant message -------------
@@ -765,22 +603,22 @@ describe("handlePermissionEvent", () => {
   // When the `config` hook hasn't surfaced `ctx.sessionModel` (e.g. the
   // hook didn't fire, or opencode's runtime Config uses different field
   // names), the handler falls back to the latest assistant message's
-  // model in the session's message stream.
+  // model in the session's transcript.
 
   it("uses assistant-message model fallback when ctx.sessionModel is undefined", async () => {
     mockedClassify.mockResolvedValueOnce({ verdict: "SAFE", reason: "r" })
     mockedSafe.mockResolvedValueOnce("allow")
 
-    // Message stream contains an assistant with a model; ctx.sessionModel
+    // Transcript contains an assistant with a model; ctx.sessionModel
     // is undefined; no classifier override.
     mockedGetSessionMessages.mockResolvedValueOnce([
-      userEntry("help me out"),
-      assistantEntryWithModel("openai", "gpt-5-codex"),
-      userEntry("thanks"),
+      userMessage("help me out"),
+      assistantMessage({ providerID: "openai", id: "gpt-5-codex" }),
+      userMessage("thanks"),
     ])
 
-    const { ctx } = buildCtx({ sessionModel: undefined })
-    await handlePermissionEvent(basePermission(), ctx)
+    const ctx = buildCtx({ sessionModel: undefined })
+    await handlePermissionEvent(makeEvaluation(), ctx)
 
     expect(mockedClassify).toHaveBeenCalledTimes(1)
     const classifyArgs = mockedClassify.mock.calls[0]?.[0]
@@ -790,32 +628,33 @@ describe("handlePermissionEvent", () => {
   })
 
   it("still skips with 'no classifier model' when every source fails", async () => {
-    // No ctx.sessionModel, no config override, message stream has no
+    // No ctx.sessionModel, no config override, transcript has no
     // assistant with a model → resolver returns null → handler skips.
-    mockedGetSessionMessages.mockResolvedValueOnce([userEntry("just me")])
-    const { ctx, respondCall } = buildCtx({ sessionModel: undefined })
+    mockedGetSessionMessages.mockResolvedValueOnce([userMessage("just me")])
+    const ctx = buildCtx({ sessionModel: undefined })
 
-    await handlePermissionEvent(basePermission(), ctx)
+    const ev = makeEvaluation()
+    await handlePermissionEvent(ev, ctx)
 
     expect(mockedClassify).not.toHaveBeenCalled()
-    expect(respondCall).not.toHaveBeenCalled()
+    expect(ev.effect).toBe("ask")
   })
 
   it("ctx.sessionModel takes precedence over the assistant-message fallback", async () => {
     mockedClassify.mockResolvedValueOnce({ verdict: "SAFE", reason: "r" })
     mockedSafe.mockResolvedValueOnce("allow")
 
-    // Assistant in stream says openai/gpt-5, but ctx.sessionModel says
+    // Assistant in transcript says openai/gpt-5, but ctx.sessionModel says
     // anthropic/claude-sonnet. The explicit ctx value wins.
     mockedGetSessionMessages.mockResolvedValueOnce([
-      userEntry("hi"),
-      assistantEntryWithModel("openai", "gpt-5"),
+      userMessage("hi"),
+      assistantMessage({ providerID: "openai", id: "gpt-5" }),
     ])
 
-    const { ctx } = buildCtx({
+    const ctx = buildCtx({
       sessionModel: { providerID: "anthropic", modelID: "claude-sonnet-4-5" },
     })
-    await handlePermissionEvent(basePermission(), ctx)
+    await handlePermissionEvent(makeEvaluation(), ctx)
 
     const classifyArgs = mockedClassify.mock.calls[0]?.[0]
     expect(classifyArgs?.model.providerID).toBe("anthropic")
@@ -826,15 +665,15 @@ describe("handlePermissionEvent", () => {
     mockedSafe.mockResolvedValueOnce("allow")
 
     mockedGetSessionMessages.mockResolvedValueOnce([
-      userEntry("hi"),
-      assistantEntryWithModel("openai", "gpt-5"),
+      userMessage("hi"),
+      assistantMessage({ providerID: "openai", id: "gpt-5" }),
     ])
 
-    const { ctx } = buildCtx({
-      classifierModel: "anthropic/claude-haiku-4-5",
+    const ctx = buildCtx({
+      config: { classifierModel: "anthropic/claude-haiku-4-5" },
       sessionModel: { providerID: "openai", modelID: "gpt-4o" },
     })
-    await handlePermissionEvent(basePermission(), ctx)
+    await handlePermissionEvent(makeEvaluation(), ctx)
 
     const classifyArgs = mockedClassify.mock.calls[0]?.[0]
     expect(classifyArgs?.model).toEqual({
@@ -845,7 +684,7 @@ describe("handlePermissionEvent", () => {
 
   // --- subagent handling ------------------------------------------------
   //
-  // When a bash permission fires inside a subagent session, the handler
+  // When a shell permission fires inside a subagent session, the handler
   // must resolve the session's root (via resolveRootSessionID) and fetch
   // user messages from THERE, not from the subagent session — whose
   // "user" role entries are actually the dispatching agent's prompts.
@@ -860,9 +699,9 @@ describe("handlePermissionEvent", () => {
     // walks up and returns the root sessionID.
     mockedResolveRoot.mockImplementationOnce(async () => "sess_root")
 
-    const { ctx } = buildCtx()
+    const ctx = buildCtx()
     await handlePermissionEvent(
-      basePermission({ sessionID: "sess_subagent" }),
+      makeEvaluation({ sessionID: "sess_subagent" }),
       ctx,
     )
 
@@ -881,9 +720,9 @@ describe("handlePermissionEvent", () => {
     // Default beforeEach behaviour: resolver returns the input sessionID
     // unchanged (i.e. already a root). No override needed.
 
-    const { ctx } = buildCtx()
+    const ctx = buildCtx()
     await handlePermissionEvent(
-      basePermission({ sessionID: "sess_root_only" }),
+      makeEvaluation({ sessionID: "sess_root_only" }),
       ctx,
     )
 
@@ -895,32 +734,30 @@ describe("handlePermissionEvent", () => {
     // Resolver fail-closed: subagent's chain couldn't be verified.
     mockedResolveRoot.mockImplementationOnce(async () => null)
 
-    const { ctx, respondCall } = buildCtx()
-    await handlePermissionEvent(
-      basePermission({ sessionID: "sess_subagent" }),
-      ctx,
-    )
+    const ctx = buildCtx()
+    const ev = makeEvaluation({ sessionID: "sess_subagent" })
+    await handlePermissionEvent(ev, ctx)
 
     // No message fetch, no classification, no response.
     expect(mockedGetSessionMessages).not.toHaveBeenCalled()
     expect(mockedClassify).not.toHaveBeenCalled()
     expect(mockedSafe).not.toHaveBeenCalled()
     expect(mockedRisky).not.toHaveBeenCalled()
-    expect(respondCall).not.toHaveBeenCalled()
+    expect(ev.effect).toBe("ask")
   })
 
   it("keeps the permission's ORIGINAL sessionID as the classifier's parentSessionID", async () => {
     // Even when the resolver discovers a different root, the ephemeral
     // classifier session should be parented at the permission's session
     // (the subagent's), so the ephemeralSessionIDs loop-guard keeps
-    // working and cleanup happens under the originating branch.
+    // working.
     mockedClassify.mockResolvedValueOnce({ verdict: "SAFE", reason: "r" })
     mockedSafe.mockResolvedValueOnce("allow")
     mockedResolveRoot.mockImplementationOnce(async () => "sess_root")
 
-    const { ctx } = buildCtx()
+    const ctx = buildCtx()
     await handlePermissionEvent(
-      basePermission({ sessionID: "sess_subagent" }),
+      makeEvaluation({ sessionID: "sess_subagent" }),
       ctx,
     )
 
@@ -937,69 +774,19 @@ describe("handlePermissionEvent", () => {
     // on which sessionID is requested. The handler should request
     // `sess_root` (the resolved root), so the classifier must see the
     // root's human messages — not the subagent's dispatch prompt.
-    mockedGetSessionMessages.mockImplementation(async (_client, id) => {
-      if (id === "sess_root") return [userEntry("the real human said this")]
-      return [userEntry("dispatching agent's prompt to subagent")]
+    mockedGetSessionMessages.mockImplementation(async (_session, id) => {
+      if (id === "sess_root") return [userMessage("the real human said this")]
+      return [userMessage("dispatching agent's prompt to subagent")]
     })
 
-    const { ctx } = buildCtx()
+    const ctx = buildCtx()
     await handlePermissionEvent(
-      basePermission({ sessionID: "sess_subagent" }),
+      makeEvaluation({ sessionID: "sess_subagent" }),
       ctx,
     )
 
     const classifyArgs = mockedClassify.mock.calls[0]?.[0]
     expect(classifyArgs?.userMessages).toEqual(["the real human said this"])
-  })
-
-  // --- root-agent filter -----------------------------------------------
-  //
-  // Defense-in-depth: even from the resolved root session, only user
-  // messages whose `info.agent` matches the root's primary agent should
-  // flow to the classifier. This catches any "user" role entries that
-  // might actually be synthetic dispatches addressed to other agents.
-
-  it("filters root user messages by the root session's primary agent", async () => {
-    mockedClassify.mockResolvedValueOnce({ verdict: "SAFE", reason: "r" })
-    mockedSafe.mockResolvedValueOnce("allow")
-
-    // Root session: first user message is with the "build" agent (the
-    // human's chosen primary). A later "general"-agent user message is
-    // synthetic and must be filtered out.
-    const buildUser = (text: string, agent: string): MessageEntry => ({
-      info: {
-        id: `u_${text}`,
-        sessionID: "sess_root",
-        role: "user",
-        time: { created: 0 },
-        agent,
-      } as unknown as MessageEntry["info"],
-      parts: [
-        {
-          id: `p_${text}`,
-          sessionID: "sess_root",
-          messageID: `u_${text}`,
-          type: "text",
-          text,
-        } as MessageEntry["parts"][number],
-      ],
-    })
-
-    mockedGetSessionMessages.mockResolvedValueOnce([
-      buildUser("real-human-1", "build"),
-      buildUser("synthetic-dispatch", "general"),
-      buildUser("real-human-2", "build"),
-    ])
-
-    const { ctx } = buildCtx()
-    await handlePermissionEvent(basePermission(), ctx)
-
-    const classifyArgs = mockedClassify.mock.calls[0]?.[0]
-    // Only the "build"-agent messages reach the classifier.
-    expect(classifyArgs?.userMessages).toEqual([
-      "real-human-1",
-      "real-human-2",
-    ])
   })
 
   // --- repo context wiring ----------------------------------------------
@@ -1012,11 +799,11 @@ describe("handlePermissionEvent", () => {
       branch: "feat/x",
       openPR: { number: 7, title: "Test", baseBranch: "main" },
     }
-    const { ctx } = buildCtx({
+    const ctx = buildCtx({
       getRepoContext: vi.fn(async () => repoCtx),
     })
 
-    await handlePermissionEvent(basePermission(), ctx)
+    await handlePermissionEvent(makeEvaluation(), ctx)
 
     const classifyArgs = mockedClassify.mock.calls[0]?.[0]
     expect(classifyArgs?.repoContext).toEqual(repoCtx)
@@ -1026,11 +813,11 @@ describe("handlePermissionEvent", () => {
     mockedClassify.mockResolvedValueOnce({ verdict: "SAFE", reason: "r" })
     mockedSafe.mockResolvedValueOnce("allow")
 
-    const { ctx } = buildCtx({
+    const ctx = buildCtx({
       getRepoContext: vi.fn(async () => null),
     })
 
-    await handlePermissionEvent(basePermission(), ctx)
+    await handlePermissionEvent(makeEvaluation(), ctx)
 
     const classifyArgs = mockedClassify.mock.calls[0]?.[0]
     expect(classifyArgs?.repoContext).toBeNull()
@@ -1040,13 +827,13 @@ describe("handlePermissionEvent", () => {
     mockedClassify.mockResolvedValueOnce({ verdict: "SAFE", reason: "r" })
     mockedSafe.mockResolvedValueOnce("allow")
 
-    const { ctx } = buildCtx({
+    const ctx = buildCtx({
       getRepoContext: vi.fn(async () => {
         throw new Error("boom")
       }),
     })
 
-    await handlePermissionEvent(basePermission(), ctx)
+    await handlePermissionEvent(makeEvaluation(), ctx)
 
     const classifyArgs = mockedClassify.mock.calls[0]?.[0]
     expect(classifyArgs?.repoContext).toBeNull()
@@ -1056,8 +843,8 @@ describe("handlePermissionEvent", () => {
     mockedClassify.mockResolvedValueOnce({ verdict: "SAFE", reason: "r" })
     mockedSafe.mockResolvedValueOnce("allow")
 
-    const { ctx } = buildCtx() // no getRepoContext provided
-    await handlePermissionEvent(basePermission(), ctx)
+    const ctx = buildCtx({ getRepoContext: undefined })
+    await handlePermissionEvent(makeEvaluation(), ctx)
 
     const classifyArgs = mockedClassify.mock.calls[0]?.[0]
     expect(classifyArgs?.repoContext).toBeNull()
@@ -1068,20 +855,18 @@ describe("handlePermissionEvent", () => {
 // external_directory permission handling
 // ---------------------------------------------------------------------------
 
-/**
- * Build a synthetic external_directory permission event using the runtime
- * shape (permission / patterns fields, not SDK-typed type / pattern).
- */
-function dirPermission(
-  path = "/Users/jacob/Documents/GitHub/premind/*",
-  overrides: Partial<{ id: string; sessionID: string }> = {},
-) {
-  return {
-    id: overrides.id ?? "perm_dir_1",
-    sessionID: overrides.sessionID ?? "sess_root",
-    permission: "external_directory",
-    patterns: [path],
-  } as never
+const DEFAULT_DIR_PATH = "/Users/jacob/Documents/GitHub/premind/*"
+
+/** Build a V2 external_directory permission evaluation. */
+function dirEvaluation(
+  path = DEFAULT_DIR_PATH,
+  overrides: Partial<PermissionEvaluation> = {},
+): PermissionEvaluation {
+  return makeEvaluation({
+    action: "external_directory",
+    resources: [path],
+    ...overrides,
+  })
 }
 
 describe("handlePermissionEvent (external_directory)", () => {
@@ -1089,54 +874,56 @@ describe("handlePermissionEvent (external_directory)", () => {
     // Default: root session resolves to itself, one user message.
     mockedResolveRoot.mockResolvedValue("sess_root")
     mockedGetSessionMessages.mockResolvedValue([
-      userEntry("please review the premind project"),
+      userMessage("please review the premind project"),
     ])
-    // Default: classifySubject returns SAFE.
-    mockedClassifySubject.mockResolvedValue({
+    // Default: classifyDirectory returns SAFE.
+    mockedClassifyDirectory.mockResolvedValue({
       verdict: "SAFE",
       reason: "user asked for premind",
     })
     mockedSafe.mockResolvedValue("allow")
   })
 
-  it("calls classifySubject (not classifyCommand) for external_directory", async () => {
-    const { ctx } = buildCtx()
-    await handlePermissionEvent(dirPermission(), ctx)
-    expect(mockedClassifySubject).toHaveBeenCalledTimes(1)
+  it("calls classifyDirectory (not classifyCommand) for external_directory", async () => {
+    const ctx = buildCtx()
+    await handlePermissionEvent(dirEvaluation(), ctx)
+    expect(mockedClassifyDirectory).toHaveBeenCalledTimes(1)
     expect(mockedClassify).not.toHaveBeenCalled()
   })
 
-  it("passes the directory path as subject to classifySubject", async () => {
-    const { ctx } = buildCtx()
+  it("passes the directory path as subject to classifyDirectory", async () => {
+    const ctx = buildCtx()
     await handlePermissionEvent(
-      dirPermission("/Users/jacob/Documents/GitHub/premind/*"),
+      dirEvaluation("/Users/jacob/Documents/GitHub/premind/*"),
       ctx,
     )
-    const args = mockedClassifySubject.mock.calls[0]?.[0]
-    expect(args?.subject).toBe("/Users/jacob/Documents/GitHub/premind/*")
+    const args = mockedClassifyDirectory.mock.calls[0]?.[0]
+    expect(args?.path).toBe("/Users/jacob/Documents/GitHub/premind/*")
   })
 
-  it("auto-approves when classifySubject returns SAFE and safe-path allows", async () => {
-    const { ctx, respondCall } = buildCtx()
-    await handlePermissionEvent(dirPermission(), ctx)
+  it("auto-approves when classifyDirectory returns SAFE and safe-path allows", async () => {
+    const ctx = buildCtx()
+    const ev = dirEvaluation()
+    await handlePermissionEvent(ev, ctx)
     expect(mockedSafe).toHaveBeenCalledTimes(1)
-    expect(respondCall).toHaveBeenCalledTimes(1)
+    expect(ev.effect).toBe("allow")
   })
 
-  it("escalates via risky-path when classifySubject returns RISKY", async () => {
-    mockedClassifySubject.mockResolvedValue({
+  it("escalates via risky-path when classifyDirectory returns RISKY", async () => {
+    mockedClassifyDirectory.mockResolvedValue({
       verdict: "RISKY",
       reason: "sensitive path",
     })
-    const { ctx, respondCall } = buildCtx()
-    await handlePermissionEvent(dirPermission(), ctx)
+    const ctx = buildCtx()
+    const ev = dirEvaluation()
+    await handlePermissionEvent(ev, ctx)
     expect(mockedRisky).toHaveBeenCalledTimes(1)
-    expect(respondCall).not.toHaveBeenCalled()
+    expect(ev.effect).toBe("ask")
   })
 
-  it("does not call classifySubject on cache hit; still runs safe-path", async () => {
+  it("does not call classifyDirectory on cache hit; still runs safe-path", async () => {
     const path = "/Users/jacob/Documents/GitHub/premind/*"
-    const { ctx } = buildCtx()
+    const ctx = buildCtx()
 
     // Pre-populate cache as SAFE.
     ctx.directoryVerdictCache.set(
@@ -1145,17 +932,17 @@ describe("handlePermissionEvent (external_directory)", () => {
       60_000,
     )
 
-    await handlePermissionEvent(dirPermission(path), ctx)
+    await handlePermissionEvent(dirEvaluation(path), ctx)
 
-    expect(mockedClassifySubject).not.toHaveBeenCalled()
+    expect(mockedClassifyDirectory).not.toHaveBeenCalled()
     expect(mockedSafe).toHaveBeenCalledTimes(1)
   })
 
   it("populates the cache after a fresh SAFE verdict", async () => {
     const path = "/Users/jacob/Documents/GitHub/premind/*"
-    const { ctx } = buildCtx()
+    const ctx = buildCtx()
 
-    await handlePermissionEvent(dirPermission(path), ctx)
+    await handlePermissionEvent(dirEvaluation(path), ctx)
 
     const cacheKey = DirectoryVerdictCache.keyFor([path])
     const cached = ctx.directoryVerdictCache.get(cacheKey)
@@ -1164,78 +951,76 @@ describe("handlePermissionEvent (external_directory)", () => {
   })
 
   it("does not populate the cache after a RISKY verdict", async () => {
-    mockedClassifySubject.mockResolvedValue({
+    mockedClassifyDirectory.mockResolvedValue({
       verdict: "RISKY",
       reason: "sensitive",
     })
     const path = "/Users/jacob/Documents/GitHub/premind/*"
-    const { ctx } = buildCtx()
+    const ctx = buildCtx()
 
-    await handlePermissionEvent(dirPermission(path), ctx)
+    await handlePermissionEvent(dirEvaluation(path), ctx)
 
     const cacheKey = DirectoryVerdictCache.keyFor([path])
     expect(ctx.directoryVerdictCache.get(cacheKey)).toBeNull()
   })
 
   it("skips external_directory when externalDirectoryEnabled is false", async () => {
-    const { ctx } = buildCtx()
-    ctx.config = { ...ctx.config, externalDirectoryEnabled: false }
+    const ctx = buildCtx({ config: { externalDirectoryEnabled: false } })
+    const ev = dirEvaluation()
 
-    await handlePermissionEvent(dirPermission(), ctx)
+    await handlePermissionEvent(ev, ctx)
 
-    expect(mockedClassifySubject).not.toHaveBeenCalled()
+    expect(mockedClassifyDirectory).not.toHaveBeenCalled()
     expect(mockedClassify).not.toHaveBeenCalled()
     expect(mockedSafe).not.toHaveBeenCalled()
+    expect(ev.effect).toBe("ask")
   })
 
   it("skips external_directory (and all others) when enabled is false", async () => {
-    const { ctx } = buildCtx({ enabled: false })
-    await handlePermissionEvent(dirPermission(), ctx)
-    expect(mockedClassifySubject).not.toHaveBeenCalled()
+    const ctx = buildCtx({ config: { enabled: false } })
+    await handlePermissionEvent(dirEvaluation(), ctx)
+    expect(mockedClassifyDirectory).not.toHaveBeenCalled()
   })
 
-  it("falls back to TUI prompt when classifySubject returns null", async () => {
-    mockedClassifySubject.mockResolvedValue(null)
-    const { ctx, respondCall } = buildCtx()
-    await handlePermissionEvent(dirPermission(), ctx)
-    expect(respondCall).not.toHaveBeenCalled()
+  it("falls back to TUI prompt when classifyDirectory returns null", async () => {
+    mockedClassifyDirectory.mockResolvedValue(null)
+    const ctx = buildCtx()
+    const ev = dirEvaluation()
+    await handlePermissionEvent(ev, ctx)
+    expect(ev.effect).toBe("ask")
     expect(mockedSafe).not.toHaveBeenCalled()
   })
 
   it("leaves TUI prompt when user cancels the safe-path countdown", async () => {
     mockedSafe.mockResolvedValue("ask")
-    const { ctx, respondCall } = buildCtx()
-    await handlePermissionEvent(dirPermission(), ctx)
-    expect(respondCall).not.toHaveBeenCalled()
+    const ctx = buildCtx()
+    const ev = dirEvaluation()
+    await handlePermissionEvent(ev, ctx)
+    expect(ev.effect).toBe("ask")
   })
 })
 
 describe("approval history wiring", () => {
   beforeEach(() => {
-    // The new wiring tests always use sess_test as the root; pin it
+    // The wiring tests always use sess_test as the root; pin it
     // explicitly rather than relying on `mockReset` leaving the mock as
     // `undefined` (which would propagate as the rootSessionID and break
     // the priorApprovals lookup test).
     mockedResolveRoot.mockResolvedValue("sess_test")
   })
 
-  it("seeds a pending subject when a bash permission first fires", async () => {
+  it("seeds a pending subject when a shell permission first fires", async () => {
     const pending = new PendingSubjectsMap()
     mockedClassify.mockResolvedValue({ verdict: "RISKY", reason: "test" })
     mockedSafe.mockResolvedValue("ask")
-    const { ctx } = buildCtx({ pendingSubjects: pending })
+    const ctx = buildCtx({ pendingSubjects: pending })
 
-    await handlePermissionEvent(
-      {
-        id: "perm_1",
-        sessionID: "sess_test",
-        type: "bash",
-        pattern: ["ls -la"],
-      } as unknown as Parameters<typeof handlePermissionEvent>[0],
-      ctx,
-    )
+    const ev = makeEvaluation({ sessionID: "sess_test", resources: ["ls -la"] })
+    await handlePermissionEvent(ev, ctx)
 
-    const taken = pending.take("perm_1")
+    // V2 keys pending entries by evaluationKey(ev) — the evaluate event
+    // carries no permission ID.
+    const taken = pending.take(evaluationKey(ev))
     expect(taken).not.toBeNull()
     expect(taken?.subject).toBe("ls -la")
     expect(taken?.subjectLabel).toBe("command")
@@ -1244,23 +1029,20 @@ describe("approval history wiring", () => {
 
   it("seeds with subjectLabel='path' for external_directory permissions", async () => {
     const pending = new PendingSubjectsMap()
-    mockedClassifySubject.mockResolvedValue({
+    mockedClassifyDirectory.mockResolvedValue({
       verdict: "RISKY",
       reason: "no context",
     })
-    const { ctx } = buildCtx({ pendingSubjects: pending })
+    const ctx = buildCtx({ pendingSubjects: pending })
 
-    await handlePermissionEvent(
-      {
-        id: "perm_dir",
-        sessionID: "sess_test",
-        type: "external_directory",
-        pattern: ["/Users/jacob/Documents/GitHub/other/*"],
-      } as unknown as Parameters<typeof handlePermissionEvent>[0],
-      ctx,
-    )
+    const ev = makeEvaluation({
+      sessionID: "sess_test",
+      action: "external_directory",
+      resources: ["/Users/jacob/Documents/GitHub/other/*"],
+    })
+    await handlePermissionEvent(ev, ctx)
 
-    const taken = pending.take("perm_dir")
+    const taken = pending.take(evaluationKey(ev))
     expect(taken?.subjectLabel).toBe("path")
   })
 
@@ -1268,19 +1050,12 @@ describe("approval history wiring", () => {
     const pending = new PendingSubjectsMap()
     mockedClassify.mockResolvedValue({ verdict: "SAFE", reason: "read-only" })
     mockedSafe.mockResolvedValue("allow")
-    const { ctx } = buildCtx({ pendingSubjects: pending })
+    const ctx = buildCtx({ pendingSubjects: pending })
 
-    await handlePermissionEvent(
-      {
-        id: "perm_2",
-        sessionID: "sess_test",
-        type: "bash",
-        pattern: ["git status"],
-      } as unknown as Parameters<typeof handlePermissionEvent>[0],
-      ctx,
-    )
+    const ev = makeEvaluation({ sessionID: "sess_test", resources: ["git status"] })
+    await handlePermissionEvent(ev, ctx)
 
-    const taken = pending.take("perm_2")
+    const taken = pending.take(evaluationKey(ev))
     expect(taken?.autoApproved).toBe(true)
   })
 
@@ -1288,19 +1063,12 @@ describe("approval history wiring", () => {
     const pending = new PendingSubjectsMap()
     mockedClassify.mockResolvedValue({ verdict: "SAFE", reason: "read-only" })
     mockedSafe.mockResolvedValue("ask")
-    const { ctx } = buildCtx({ pendingSubjects: pending })
+    const ctx = buildCtx({ pendingSubjects: pending })
 
-    await handlePermissionEvent(
-      {
-        id: "perm_3",
-        sessionID: "sess_test",
-        type: "bash",
-        pattern: ["git status"],
-      } as unknown as Parameters<typeof handlePermissionEvent>[0],
-      ctx,
-    )
+    const ev = makeEvaluation({ sessionID: "sess_test", resources: ["git status"] })
+    await handlePermissionEvent(ev, ctx)
 
-    const taken = pending.take("perm_3")
+    const taken = pending.take(evaluationKey(ev))
     expect(taken?.autoApproved).toBe(false)
   })
 
@@ -1316,15 +1084,13 @@ describe("approval history wiring", () => {
     })
     mockedClassify.mockResolvedValue({ verdict: "SAFE", reason: "stub" })
     mockedSafe.mockResolvedValue("allow")
-    const { ctx } = buildCtx({ approvalHistory: history })
+    const ctx = buildCtx({ approvalHistory: history })
 
     await handlePermissionEvent(
-      {
-        id: "perm_4",
+      makeEvaluation({
         sessionID: "sess_test",
-        type: "bash",
-        pattern: ["gh pr comment 1 -b 'b'"],
-      } as unknown as Parameters<typeof handlePermissionEvent>[0],
+        resources: ["gh pr comment 1 -b 'b'"],
+      }),
       ctx,
     )
 
@@ -1348,18 +1114,13 @@ describe("approval history wiring", () => {
     })
     mockedClassify.mockResolvedValue({ verdict: "SAFE", reason: "stub" })
     mockedSafe.mockResolvedValue("allow")
-    const { ctx } = buildCtx({
+    const ctx = buildCtx({
       approvalHistory: history,
-      approvalHistoryEnabled: false,
+      config: { approvalHistoryEnabled: false },
     })
 
     await handlePermissionEvent(
-      {
-        id: "perm_5",
-        sessionID: "sess_test",
-        type: "bash",
-        pattern: ["ls"],
-      } as unknown as Parameters<typeof handlePermissionEvent>[0],
+      makeEvaluation({ sessionID: "sess_test", resources: ["ls"] }),
       ctx,
     )
 
@@ -1374,19 +1135,12 @@ describe("approval history wiring", () => {
       reason: "looks fine",
     })
     mockedSafe.mockResolvedValue("ask")
-    const { ctx } = buildCtx({ pendingSubjects: pending })
+    const ctx = buildCtx({ pendingSubjects: pending })
 
-    await handlePermissionEvent(
-      {
-        id: "perm_6",
-        sessionID: "sess_test",
-        type: "bash",
-        pattern: ["ls"],
-      } as unknown as Parameters<typeof handlePermissionEvent>[0],
-      ctx,
-    )
+    const ev = makeEvaluation({ sessionID: "sess_test", resources: ["ls"] })
+    await handlePermissionEvent(ev, ctx)
 
-    const taken = pending.take("perm_6")
+    const taken = pending.take(evaluationKey(ev))
     expect(taken?.classifierVerdict).toBe("SAFE")
     expect(taken?.classifierReason).toBe("looks fine")
   })
@@ -1400,7 +1154,7 @@ describe("dual repo context wiring", () => {
   it("passes the dual repo context through to the classifier", async () => {
     mockedClassify.mockResolvedValue({ verdict: "SAFE", reason: "stub" })
     mockedSafe.mockResolvedValue("allow")
-    const { ctx } = buildCtx({
+    const ctx = buildCtx({
       getRepoContext: async () => ({
         pinned: {
           branch: "feat/x",
@@ -1414,12 +1168,10 @@ describe("dual repo context wiring", () => {
     })
 
     await handlePermissionEvent(
-      {
-        id: "perm_dual",
+      makeEvaluation({
         sessionID: "sess_test",
-        type: "bash",
-        pattern: ["gh pr comment 99 -b 'reply'"],
-      } as unknown as Parameters<typeof handlePermissionEvent>[0],
+        resources: ["gh pr comment 99 -b 'reply'"],
+      }),
       ctx,
     )
 
