@@ -108,9 +108,19 @@ export function sanitizeUserMessageForClassifier(text: string): string {
  * classifier a giant context dump that derails it.
  *
  * Note: V1 also filtered user messages by the root session's primary agent
- * (`info.agent`). The V2 flat message union carries no per-message agent
- * field, so that defense-in-depth layer is gone; root-session resolution
- * upstream remains the primary guard against classifying subagent dispatches.
+ * (`info.agent`), which we do NOT do here. Two reasons:
+ *
+ *   1. There is no field to filter on. In the V2 message schema only
+ *      `type: "assistant"` carries an `agent`; the `user` variant does not.
+ *   2. The threat it guarded against is structurally excluded. A subagent
+ *      dispatch is a tool call inside an `assistant` message (filtered out by
+ *      the `type !== "user"` check above) and the subagent itself runs in a
+ *      child session (`parentID`), while callers resolve the ROOT session via
+ *      `resolveRootSessionID` before reading. So a subagent's prompt cannot
+ *      surface as a `user` message in the transcript we read.
+ *
+ * Re-check this if opencode ever adds an agent/author field to `user`
+ * messages, or starts copying child-session prompts into a parent transcript.
  */
 export function extractLastUserMessages(
   messages: readonly TranscriptMessage[],

