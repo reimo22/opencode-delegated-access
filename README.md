@@ -1,11 +1,61 @@
 > **Fork notice (reimo22/opencode-delegated-access):** this fork exists to hold
 > a port of [jdtzmn/opencode-delegated-access](https://github.com/jdtzmn/opencode-delegated-access)
-> to the OpenCode V2 plugin API (`@opencode/plugin`, `Plugin.define` with
-> `ctx.*` domains), which upstream does not have yet (upstream is V1,
-> dormant since 2026-06, latest release v0.4.0).
+> to the OpenCode **V2** plugin API (`@opencode/plugin`, `Plugin.define` with `ctx.*`
+> domains). Upstream is V1-only and dormant since 2026-06 (latest release v0.4.0).
 >
-> - **`main`** — currently identical to upstream v0.4.0 (V1-only, OpenCode 1.x).
-> - **`v2` branch** — the V2 port. Not started yet.
+> - **`main`** — identical to upstream v0.4.0. V1, OpenCode 1.x. Unchanged.
+> - **`v2`** — the V2 port. Verified against OpenCode 2.0.3: a SAFE command
+>   auto-approves with no prompt; a RISKY command raises both the TUI prompt and a
+>   desktop notification. 433 unit tests pass and `tsc --noEmit` is clean
+>   (`npm test`, `npm run check`). Requires `@opencode/plugin` ^2.0.3 and Node ≥22.
+>
+> ### Fork differences
+>
+> The behavior described below is unchanged. The plumbing is not, so the install,
+> notification, and message-filtering sections read differently here.
+>
+> - **Install on V2.** A local *directory* plugin is resolved by `<root>/server.*` or
+>   `<root>/index.*`; `package.json` `main`/`exports` are ignored on that path, and a
+>   mismatch is dropped silently. The root `server.ts` shim exists for that. Point config
+>   at the directory, not at `src/index.ts`:
+>   ```jsonc
+>   {
+>     "plugin": [{ "package": "/absolute/path/to/opencode-delegated-access" }]
+>   }
+>   ```
+>   Options attach to that same entry as `"options": { … }`; §3 below lists the option
+>   names. Upstream's `"…/src/index.ts"` and `…@git+https://…` plugin forms do not load
+>   under V2.
+> - **Hook model.** V2 dispatches one hook per request kind (`context`, `compaction`,
+>   `generate`, `title`); the classifier's isolated system prompt is installed on the hooks
+>   it needs instead of by rewriting a single `system` array
+>   (`src/classifier/ephemeral-system.ts`).
+> - **Notifications work off macOS.** Upstream constructed node-notifier's macOS-only
+>   `NotificationCenter` backend unconditionally; on Linux and Windows every notification
+>   failed and RISKY escalation degraded to TUI-only without saying so. This branch uses
+>   `NotificationCenter` on macOS and the cross-platform `notify()` entry point
+>   (notify-send / toast) elsewhere. **Non-macOS notifications carry no buttons** —
+>   node-notifier's notify-send reporter drops the `actions` argument — so there the
+>   notification is informational and OpenCode's TUI prompt is the decision point. That is
+>   upstream's "Works best on macOS" caveat, now degraded loudly rather than failing softly.
+> - **Root-agent message filtering is gone.** The "How it's safe" bullet claiming user-role
+>   messages are filtered to the root's primary agent no longer describes the code. V2
+>   `user` messages carry no `agent` field, so the filter had nothing to read; the threat is
+>   structurally excluded instead — a subagent dispatch is a tool call inside an
+>   `assistant` message, and subagents run in child sessions while the plugin reads the
+>   resolved root session. The fail-closed guarantee is unchanged: no verdict means the TUI
+>   prompt stays. Rationale and a re-check trigger live in `src/ui/messages.ts`.
+> - **A log file exists.** V2 runs the service with stdout on `/dev/null`, so a plugin
+>   cannot be debugged without writing a file. Decisions, verdicts, and notification
+>   outcomes are appended to `${XDG_STATE_HOME:-~/.local/state}/opencode/delegated-access.log`
+>   (`src/log.ts`).
+> - **Build with npm, not bun.** `npm test` (vitest) and `npm run check` (`tsc --noEmit`);
+>   `check` covers test files, which an earlier, now-deleted `tsconfig.check.json` excluded.
+> - **`@opencode/plugin` is pinned to `^2.0.3` on this branch.** `2.0.4` is held back by
+>   npm's `min-release-age` freshness gate until 2026-09-19; restore `^2.0.4` and
+>   regenerate the lockfile after that date.
+>
+> Not submitted upstream.
 
 ---
 # Delegated Access
