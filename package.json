@@ -21,7 +21,7 @@
   ],
   "license": "MIT",
   "dependencies": {
-    "@opencode/plugin": "^2.0.4",
+    "@opencode/plugin": "^2.0.3",
     "node-notifier": "^10.0.1",
     "zod": "^3.25.76"
   },
