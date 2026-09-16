@@ -1,134 +1,100 @@
-import { describe, it, expect, vi, beforeEach, afterEach } from "vitest"
-import { createLogger, LOG_SERVICE } from "./log.ts"
+import { describe, it, expect, beforeEach, afterEach } from "vitest"
+import { mkdtempSync, readFileSync, rmSync } from "node:fs"
+import { tmpdir } from "node:os"
+import { join } from "node:path"
+import { createLogger, defaultLogPath, LOG_SERVICE } from "./log.ts"
 
-function buildClient(impl?: (opts: unknown) => Promise<unknown>) {
-  const logCall = vi.fn(impl ?? (async () => ({ data: {} } as unknown)))
-  return {
-    client: { app: { log: logCall } } as never,
-    logCall,
-  }
+/** Wait until the fire-and-forget append has landed in the file. */
+async function readLogLines(path: string): Promise<string[]> {
+  const { vi } = await import("vitest")
+  await vi.waitFor(() => {
+    expect(readFileSync(path, "utf8").length).toBeGreaterThan(0)
+  })
+  return readFileSync(path, "utf8").trimEnd().split("\n")
 }
 
-/** Wait one macrotask so fire-and-forget promises settle. */
-const flush = () => new Promise((r) => setTimeout(r, 0))
-
 describe("createLogger", () => {
-  let errSpy: ReturnType<typeof vi.spyOn>
+  let dir: string
+  let logPath: string
 
   beforeEach(() => {
-    errSpy = vi.spyOn(console, "error").mockImplementation(() => {})
+    dir = mkdtempSync(join(tmpdir(), "delegated-access-log-"))
+    logPath = join(dir, "delegated-access.log")
   })
 
   afterEach(() => {
-    errSpy.mockRestore()
+    rmSync(dir, { recursive: true, force: true })
   })
 
-  it("emits info/debug/warn/error through client.app.log with the service tag", async () => {
-    const { client, logCall } = buildClient()
-    const log = createLogger(client)
+  it("appends every level to the log file with the service prefix", async () => {
+    const log = createLogger(logPath)
 
     log.debug("d-msg")
     log.info("i-msg")
     log.warn("w-msg")
     log.error("e-msg")
-    await flush()
 
-    expect(logCall).toHaveBeenCalledTimes(4)
-    const bodies = logCall.mock.calls.map(
-      (c) => (c[0] as { body: { service: string; level: string; message: string } }).body,
+    const lines = await readLogLines(logPath)
+    expect(lines).toHaveLength(4)
+    expect(lines[0]).toContain(`[${LOG_SERVICE}] debug d-msg`)
+    expect(lines[1]).toContain(`[${LOG_SERVICE}] info i-msg`)
+    expect(lines[2]).toContain(`[${LOG_SERVICE}] warn w-msg`)
+    expect(lines[3]).toContain(`[${LOG_SERVICE}] error e-msg`)
+  })
+
+  it("renders extra metadata as JSON on the same line", async () => {
+    const log = createLogger(logPath)
+
+    log.info("verdict parsed", { verdict: "SAFE", attempt: 1 })
+
+    const lines = await readLogLines(logPath)
+    expect(lines[0]).toContain('"verdict":"SAFE"')
+    expect(lines[0]).toContain('"attempt":1')
+  })
+
+  it("keeps appending across calls rather than truncating", async () => {
+    const log = createLogger(logPath)
+
+    log.info("first")
+    await readLogLines(logPath)
+    log.info("second")
+
+    const { vi } = await import("vitest")
+    await vi.waitFor(async () => {
+      const content = readFileSync(logPath, "utf8")
+      expect(content).toContain("first")
+      expect(content).toContain("second")
+    })
+  })
+
+  it("never throws when the log path is unwritable", () => {
+    const log = createLogger(join(dir, "missing-dir", "nested", "x.log"))
+
+    expect(() => log.info("dropped")).not.toThrow()
+  })
+})
+
+describe("defaultLogPath", () => {
+  const original = process.env.XDG_STATE_HOME
+
+  afterEach(() => {
+    if (original === undefined) delete process.env.XDG_STATE_HOME
+    else process.env.XDG_STATE_HOME = original
+  })
+
+  it("follows XDG_STATE_HOME when set", () => {
+    process.env.XDG_STATE_HOME = "/tmp/xdg-state"
+
+    expect(defaultLogPath()).toBe(
+      join("/tmp/xdg-state", "opencode", `${LOG_SERVICE}.log`),
     )
-    expect(bodies).toEqual([
-      { service: LOG_SERVICE, level: "debug", message: "d-msg" },
-      { service: LOG_SERVICE, level: "info", message: "i-msg" },
-      { service: LOG_SERVICE, level: "warn", message: "w-msg" },
-      { service: LOG_SERVICE, level: "error", message: "e-msg" },
-    ])
   })
 
-  it("passes extra metadata through to client.app.log", async () => {
-    const { client, logCall } = buildClient()
-    const log = createLogger(client)
+  it("falls back under the home directory when XDG_STATE_HOME is unset", () => {
+    delete process.env.XDG_STATE_HOME
 
-    log.info("hello", { permissionID: "perm_1", verdict: "SAFE" })
-    await flush()
-
-    expect(logCall).toHaveBeenCalledTimes(1)
-    const body = (logCall.mock.calls[0]?.[0] as {
-      body: { extra?: Record<string, unknown> }
-    }).body
-    expect(body.extra).toEqual({ permissionID: "perm_1", verdict: "SAFE" })
-  })
-
-  it("omits the extra key when no metadata is passed", async () => {
-    const { client, logCall } = buildClient()
-    const log = createLogger(client)
-
-    log.info("hello")
-    await flush()
-
-    const body = (logCall.mock.calls[0]?.[0] as {
-      body: { extra?: unknown }
-    }).body
-    expect(body.extra).toBeUndefined()
-  })
-
-  it("is fire-and-forget: returns void synchronously", () => {
-    const { client } = buildClient()
-    const log = createLogger(client)
-    const result = log.info("hi")
-    expect(result).toBeUndefined()
-  })
-
-  it("never throws even if the client.app.log call rejects", async () => {
-    const { client } = buildClient(async () => {
-      throw new Error("boom")
-    })
-    const log = createLogger(client)
-
-    expect(() => log.info("hi")).not.toThrow()
-    await flush()
-
-    // Fallback to console.error.
-    expect(errSpy).toHaveBeenCalledTimes(1)
-    const fallbackMsg = errSpy.mock.calls[0]?.[0] as string
-    expect(fallbackMsg).toContain("[delegated-access]")
-    expect(fallbackMsg).toContain("info")
-    expect(fallbackMsg).toContain("hi")
-    expect(fallbackMsg).toContain("boom")
-  })
-
-  it("never throws even if the client.app.log call throws synchronously", async () => {
-    const client = {
-      app: {
-        log: () => {
-          throw new Error("sync boom")
-        },
-      },
-    } as never
-    const log = createLogger(client)
-
-    expect(() => log.error("oops", { ctx: "x" })).not.toThrow()
-    await flush()
-
-    expect(errSpy).toHaveBeenCalledTimes(1)
-    const fallbackMsg = errSpy.mock.calls[0]?.[0] as string
-    expect(fallbackMsg).toContain("error")
-    expect(fallbackMsg).toContain("oops")
-    expect(fallbackMsg).toContain('"ctx":"x"')
-    expect(fallbackMsg).toContain("sync boom")
-  })
-
-  it("fallback formats extra as JSON", async () => {
-    const { client } = buildClient(async () => {
-      throw new Error("fail")
-    })
-    const log = createLogger(client)
-
-    log.warn("msg", { count: 3, nested: { ok: true } })
-    await flush()
-
-    const out = errSpy.mock.calls[0]?.[0] as string
-    expect(out).toContain('"count":3')
-    expect(out).toContain('"nested":{"ok":true}')
+    expect(defaultLogPath()).toContain(
+      join(".local", "state", "opencode", `${LOG_SERVICE}.log`),
+    )
   })
 })
