@@ -5,6 +5,18 @@
 > dormant since 2026-06, latest release v0.4.0).
 >
 > - **`main`** — currently identical to upstream v0.4.0 (V1-only, OpenCode 1.x).
+> - **`v2` branch** — the V2 port. Ported on 2026-09-16, typechecked,
+>   **not yet runtime-verified**; do not enable in a live config until it has
+>   been exercised (it is a security-sensitive auto-approver). V1-era test
+>   fixtures still await their own port; pure-logic tests pass.
+
+---
+> a port of [jdtzmn/opencode-delegated-access](https://github.com/jdtzmn/opencode-delegated-access)
+> to the OpenCode V2 plugin API (`@opencode/plugin`, `Plugin.define` with
+> `ctx.*` domains), which upstream does not have yet (upstream is V1,
+> dormant since 2026-06, latest release v0.4.0).
+>
+> - **`main`** — currently identical to upstream v0.4.0 (V1-only, OpenCode 1.x).
 > - **`v2` branch** — the V2 port. Not started yet.
 
 ---
