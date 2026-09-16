@@ -1,15 +1,14 @@
-import type { createOpencodeClient, Permission } from "@opencode-ai/sdk"
 import type { DelegatedAccessConfig } from "../config.ts"
 import {
   extractLastUserMessages,
   extractLatestAssistantModel,
-  extractRootAgent,
   getSessionMessages,
 } from "../ui/messages.ts"
 import {
   classifyCommand,
-  classifySubject,
+  classifyDirectory,
   type ClassifyFailureClass,
+  type ClassifierSession,
 } from "../classifier/classify.ts"
 import {
   runFailureNotificationInBackground,
@@ -17,10 +16,6 @@ import {
 } from "./failure-notify.ts"
 import { resolveClassifierModel, type ModelRef } from "../classifier/model.ts"
 import { resolveRootSessionID } from "../ui/session-tree.ts"
-import {
-  DIRECTORY_CLASSIFIER_SYSTEM_PROMPT,
-  buildDirectoryClassifierUserPrompt,
-} from "../classifier/prompt.ts"
 import { DirectoryVerdictCache } from "./directory-cache.ts"
 import { ApprovalHistoryStore } from "./approval-history.ts"
 import { PendingSubjectsMap } from "./pending-subjects.ts"
@@ -34,47 +29,92 @@ import {
   type DualRepoContext,
 } from "../repo-context.ts"
 
-type OpencodeClient = ReturnType<typeof createOpencodeClient>
+/**
+ * Structural slices of the V2 plugin domains this handler needs. (Structural
+ * typing keeps us resilient to minor shape drift — the V2 package root
+ * doesn't export domain types directly.)
+ */
+export type SessionAccess = ClassifierSession & {
+  get(input: { sessionID: string }): Promise<{ parentID?: string } | undefined>
+  context(input: {
+    sessionID: string
+  }): Promise<
+    Array<{
+      type?: string
+      text?: string
+      model?: { providerID?: string; id?: string }
+    }> | undefined
+  >
+}
+export type PermissionAccess = {
+  list(input: { sessionID: string }): Promise<
+    Array<{
+      id: string
+      sessionID: string
+      action: string
+      resources: Array<string>
+    }> | undefined
+  >
+  reply(input: {
+    sessionID: string
+    requestID: string
+    reply: "once" | "always" | "reject"
+  }): Promise<unknown>
+}
+export type OpencodeAccess = {
+  session: SessionAccess
+  permission: PermissionAccess
+}
 
 /**
- * Permission types that our plugin classifies for bash commands.
- *
- * OpenCode's `Permission.type` is `string` (no enum in the SDK), so we match
- * defensively. Different tool names observed in practice are listed below;
- * additional synonyms can be added if opencode versions diverge.
+ * The V2 permission evaluate-hook event. `effect` is mutable: set it to
+ * `"allow"` to auto-approve BEFORE opencode shows its TUI prompt; leave it
+ * as `"ask"` to fall through to the normal prompt.
  */
-const BASH_TYPE_MATCHES = new Set(["bash", "command"])
+export type PermissionEvaluation = {
+  sessionID: string
+  action: string
+  resources: ReadonlyArray<string>
+  effect: "allow" | "deny" | "ask"
+  message?: string
+}
 
-/** Runtime permission type string for external-directory access. */
-const EXTERNAL_DIRECTORY_TYPE = "external_directory"
+/**
+ * Permission actions that our plugin classifies for shell commands.
+ *
+ * V2 renamed the bash action to `shell`; older names are matched
+ * defensively. The `action` is `string` (no enum), so we match loosely.
+ */
+const BASH_ACTION_MATCHES = new Set(["shell", "bash", "command"])
+
+/** Runtime permission action for external-directory access. */
+const EXTERNAL_DIRECTORY_ACTION = "external_directory"
 
 export type HandlerContext = {
-  client: OpencodeClient
+  opencode: OpencodeAccess
   config: DelegatedAccessConfig
   /**
    * The session's currently-configured model, used to pick a small default
    * classifier model when `config.classifierModel` is not set. `undefined` is
-   * allowed (we just fall back to config-override only).
+   * allowed (we just fall back to config-override / latest-assistant-model).
    */
   sessionModel: ModelRef | undefined
   /**
    * Track IDs of ephemeral classifier sessions we create. Used by the plugin
-   * entry as a loop-guard: if a `permission.asked` event's sessionID is in
-   * this set, the plugin skips it (defense-in-depth — the classifier uses
-   * `tools: { "*": false }` and shouldn't generate permissions, but we guard
-   * anyway).
+   * entry as a loop-guard: if a permission evaluation's sessionID is in this
+   * set, the plugin skips it (defense-in-depth — the classifier's tools are
+   * cleared in the session context hook and shouldn't request permissions,
+   * but we guard anyway).
    */
   ephemeralSessionIDs: Set<string>
   /**
-   * Optional registry mapping an ephemeral classifier session ID to the
-   * system prompt it should use, read by the
-   * `experimental.chat.system.transform` hook to STRIP opencode's global
-   * agent preamble/instructions from the classifier prompt (otherwise the
-   * classifier inherits e.g. "you MUST invoke the using-superpowers skill"
-   * and never emits a VERDICT). When absent, the isolation hook is a no-op
-   * (e.g. in unit tests that don't exercise it).
+   * Registry mapping an ephemeral classifier session ID to the system prompt
+   * it should use, read by the `session.hook("context")` handler in
+   * src/index.ts to REPLACE opencode's global system preamble/instructions
+   * with the classifier prompt (otherwise the classifier inherits e.g. "you
+   * MUST invoke the using-superpowers skill" and never emits a VERDICT).
    */
-  ephemeralSystemRegistry?: import("../classifier/ephemeral-system.ts").EphemeralSystemRegistry
+  ephemeralSystemRegistry: import("../classifier/ephemeral-system.ts").EphemeralSystemRegistry
   /**
    * Shared TTL cache for recent SAFE external_directory verdicts. A single
    * instance is held for the plugin's lifetime and shared across all
@@ -90,17 +130,19 @@ export type HandlerContext = {
    */
   approvalHistory: ApprovalHistoryStore
   /**
-   * Short-lived map of `permissionID → { rootSessionID, subject, ... }`
-   * populated when a permission first fires and drained when the
-   * matching `permission.replied` event arrives. Bridges the gap between
-   * the rich subject info the handler sees and the bare permissionID the
-   * replied event carries.
+   * Short-lived map of `permissionKey → { rootSessionID, subject, ... }`
+   * populated when a permission evaluation fires and drained when the
+   * matching `permission.replied` event arrives. V2's evaluate event carries
+   * no permission ID, so entries are keyed by
+   * `sessionID + "\n" + action + "\n" + resources.join("\n")` (see
+   * {@link evaluationKey}); the replied event carries the real requestID,
+   * which we resolve to a key via the permission list.
    */
   pendingSubjects: PendingSubjectsMap
   /**
    * Shared batcher for SAFE-path notifications. Coalesces concurrent
    * notifications (e.g. burst external_directory requests) into a single
-   * macOS notification so they don't cancel each other out.
+   * desktop notification so they don't cancel each other out.
    */
   safePathBatcher: SafePathBatcher
   /**
@@ -126,62 +168,36 @@ export type HandlerContext = {
 }
 
 /**
- * Output object shape for the `permission.ask` hook. If provided, setting
- * `.status = "allow"` here auto-approves the permission BEFORE opencode
- * shows its TUI prompt (true pre-ask interception).
- *
- * For the `event` and `"permission.updated"` hooks the permission has
- * already been queued and the TUI prompt is already on-screen — in those
- * cases `output` is undefined and we resolve via the SDK respond endpoint.
+ * Stable key for a permission evaluation. Used because the V2 evaluate event
+ * carries no permission ID; see {@link HandlerContext.pendingSubjects}.
  */
-export type HandlerOutput = { status: "ask" | "deny" | "allow" }
+export function evaluationKey(ev: {
+  sessionID: string
+  action: string
+  resources: ReadonlyArray<string>
+}): string {
+  return [ev.sessionID, ev.action, ...ev.resources].join("\n")
+}
 
 /**
- * React to a permission request from opencode.
+ * React to a permission evaluation from opencode's V2 permission
+ * evaluate hook.
  *
- * This function is dispatched from three possible hooks for compatibility:
- *
- *   - `permission.ask` (typed in SDK; rarely dispatched by the 1.4.x runtime
- *     today — we register it defensively for forward-compat). When fired
- *     with `output`, setting `output.status = "allow"` pre-empts the TUI
- *     prompt entirely — no flash.
- *   - `permission.updated` (fires reliably on 1.4.x; what notification.js
- *     uses). No `output`; we resolve via the SDK respond endpoint after the
- *     TUI prompt is already showing. User sees a brief flash.
- *   - `event` hook filtered to `permission.asked` / `permission.updated`
- *     types (belt-and-suspenders). Same as `permission.updated` semantics.
- *
- * Shared dedupe (via `ctx`'s caller) ensures each permissionID is handled
- * exactly once regardless of how many hooks fire for it.
+ * The hook fires BEFORE the TUI prompt is created. Setting
+ * `ev.effect = "allow"` auto-approves with no flash; leaving `effect`
+ * untouched (or any failure path) falls through to the normal prompt.
+ * Everything in here is fail-closed: on any uncertainty we return without
+ * touching `ev.effect` and the human decides.
  */
 export async function handlePermissionEvent(
-  permission: Permission,
+  ev: PermissionEvaluation,
   ctx: HandlerContext,
-  opts: { hookName: string; output?: HandlerOutput } = { hookName: "unknown" },
 ): Promise<void> {
-  const { hookName, output } = opts
   const { log } = ctx
 
-  // Runtime-shape adapter.
-  //
-  // The SDK's typed Permission declares `type: string` and `pattern: string |
-  // string[]`, but the opencode 1.4.x event stream actually emits
-  // `{ permission: string, patterns: string[] }` (different field names).
-  // Prefer the runtime names, fall back to the SDK-typed names so both
-  // shapes and our test fixtures keep working.
-  const runtimeShape = permission as unknown as {
-    permission?: string
-    patterns?: string[]
-    type?: string
-    pattern?: string | string[]
-  }
-  const toolType = runtimeShape.permission ?? runtimeShape.type
-  const patterns = runtimeShape.patterns ?? runtimeShape.pattern
-
   const base = {
-    hook: hookName,
-    permissionID: permission.id,
-    permissionType: toolType,
+    permissionAction: ev.action,
+    permissionSessionID: ev.sessionID,
   }
 
   // Disabled → let opencode's normal approval machinery handle it.
@@ -190,60 +206,52 @@ export async function handlePermissionEvent(
     return
   }
 
-  // Dispatch by permission type.
-  if (toolType && BASH_TYPE_MATCHES.has(toolType)) {
-    const command = extractBashCommand(patterns)
+  // Dispatch by permission action.
+  if (BASH_ACTION_MATCHES.has(ev.action)) {
+    const command = extractBashCommand(ev.resources)
     if (command === null) {
-      log.info("skip: no command in pattern", {
+      log.info("skip: no command in resources", {
         ...base,
-        pattern: patterns as unknown,
+        resources: ev.resources as unknown,
       })
       return
     }
     await handleSubjectPermission({
       subject: command,
       subjectLabel: "command",
-      systemPrompt: null, // signals: use classifyCommand (bash-specific)
-      permission,
+      directory: false,
+      ev,
       ctx,
-      output,
       base,
     })
     return
   }
 
-  if (toolType === EXTERNAL_DIRECTORY_TYPE) {
+  if (ev.action === EXTERNAL_DIRECTORY_ACTION) {
     if (!ctx.config.externalDirectoryEnabled) {
       log.info("skip: external_directory auto-approval disabled", base)
       return
     }
-    const path = extractCommand(patterns) // same extraction logic — first pattern
+    const path = extractFirstResource(ev.resources)
     if (path === null) {
-      log.info("skip: no path in external_directory pattern", {
+      log.info("skip: no path in external_directory resources", {
         ...base,
-        pattern: patterns as unknown,
+        resources: ev.resources as unknown,
       })
       return
     }
-    const patternsList = Array.isArray(patterns)
-      ? (patterns as string[]).filter(Boolean)
-      : typeof patterns === "string" && patterns
-        ? [patterns]
-        : []
     await handleSubjectPermission({
       subject: path,
       subjectLabel: "path",
-      systemPrompt: DIRECTORY_CLASSIFIER_SYSTEM_PROMPT,
-      permission,
+      directory: true,
+      ev,
       ctx,
-      output,
       base,
-      directoryPatterns: patternsList,
     })
     return
   }
 
-  log.info("skip: unsupported permission type", base)
+  log.info("skip: unsupported permission action", base)
 }
 
 // ---------------------------------------------------------------------------
@@ -251,34 +259,21 @@ export async function handlePermissionEvent(
 // ---------------------------------------------------------------------------
 
 /**
- * Shared classification + response flow for any permission subject (bash
- * command or directory path). The two permission types differ only in:
+ * Shared classification + response flow for any permission subject (shell
+ * command or directory path). The two permission actions differ only in:
  *   - `subject` string (the thing being classified)
- *   - `systemPrompt` (null → use the bash-specific `classifyCommand` wrapper;
- *     non-null → use the generic `classifySubject` with the given prompt)
- *   - `directoryPatterns` (only set for directory permissions — used for the
- *     burst-deduplication cache lookup)
+ *   - `directory` (selects the bash vs directory classifier + the burst
+ *     deduplication cache lookup)
  */
 async function handleSubjectPermission(args: {
   subject: string
   subjectLabel: "command" | "path"
-  systemPrompt: string | null
-  permission: Permission
+  directory: boolean
+  ev: PermissionEvaluation
   ctx: HandlerContext
-  output: HandlerOutput | undefined
   base: Record<string, unknown>
-  directoryPatterns?: string[]
 }): Promise<void> {
-  const {
-    subject,
-    subjectLabel,
-    systemPrompt,
-    permission,
-    ctx,
-    output,
-    base,
-    directoryPatterns,
-  } = args
+  const { subject, subjectLabel, directory, ev, ctx, base } = args
   const { log } = ctx
 
   // ---- Root-session resolution -------------------------------------------
@@ -289,8 +284,8 @@ async function handleSubjectPermission(args: {
   //
   // Fail-closed: null → TUI prompt remains, user decides manually.
   const rootSessionID = await resolveRootSessionID(
-    ctx.client,
-    permission.sessionID,
+    ctx.opencode.session,
+    ev.sessionID,
   )
   if (rootSessionID === null) {
     log.warn(
@@ -299,10 +294,9 @@ async function handleSubjectPermission(args: {
     )
     return
   }
-  if (rootSessionID !== permission.sessionID) {
+  if (rootSessionID !== ev.sessionID) {
     log.info("resolved subagent to root session", {
       ...base,
-      permissionSessionID: permission.sessionID,
       rootSessionID,
     })
   }
@@ -311,10 +305,11 @@ async function handleSubjectPermission(args: {
   //
   // We seed BEFORE the directory-cache lookup so that on a cache hit (which
   // skips the classifier) the replied-event handler can still match the
-  // permissionID back to its subject text. The classifier-verdict fields
+  // permission back to its subject text. The classifier-verdict fields
   // are filled in later (after classification) and the autoApproved flag
   // is set inside `runSafeOrRiskyPath` when we resolve a SAFE verdict.
-  ctx.pendingSubjects.set(permission.id, {
+  const key = evaluationKey(ev)
+  ctx.pendingSubjects.set(key, {
     rootSessionID,
     subject,
     subjectLabel,
@@ -324,8 +319,8 @@ async function handleSubjectPermission(args: {
   })
 
   // ---- Directory cache lookup (directories only) -------------------------
-  if (directoryPatterns) {
-    const cacheKey = DirectoryVerdictCache.keyFor(directoryPatterns)
+  if (directory) {
+    const cacheKey = DirectoryVerdictCache.keyFor([...ev.resources])
     const cached = ctx.directoryVerdictCache.get(cacheKey)
     if (cached) {
       log.info("directory cache hit — skipping classifier", {
@@ -336,7 +331,7 @@ async function handleSubjectPermission(args: {
       })
       // Update the pending entry with the cached verdict so the replied
       // handler has a verdict to record (even on the cache-hit path).
-      ctx.pendingSubjects.update(permission.id, (cur) => ({
+      ctx.pendingSubjects.update(key, (cur) => ({
         ...cur,
         classifierVerdict: cached.verdict.verdict,
         classifierReason: cached.verdict.reason,
@@ -347,9 +342,8 @@ async function handleSubjectPermission(args: {
         verdict: cached.verdict,
         subject,
         subjectLabel,
-        permission,
+        ev,
         ctx,
-        output,
         base,
       })
       return
@@ -359,7 +353,7 @@ async function handleSubjectPermission(args: {
   // ---- Message extraction ------------------------------------------------
   let entries
   try {
-    entries = await getSessionMessages(ctx.client, rootSessionID)
+    entries = await getSessionMessages(ctx.opencode.session, rootSessionID)
   } catch (e) {
     log.error("getSessionMessages failed", {
       ...base,
@@ -368,18 +362,9 @@ async function handleSubjectPermission(args: {
     return
   }
 
-  const rootAgent = extractRootAgent(entries)
-  if (rootAgent === null && entries.length > 0) {
-    log.warn(
-      "could not identify root session's primary agent; filter skipped",
-      { ...base, rootSessionID },
-    )
-  }
-
   const userMessages = extractLastUserMessages(
     entries,
     ctx.config.contextMessageCount,
-    rootAgent ?? undefined,
   )
   const fallbackModel = extractLatestAssistantModel(entries)
 
@@ -447,9 +432,9 @@ async function handleSubjectPermission(args: {
 
   // ---- Classifier call ---------------------------------------------------
   const commonClassifyArgs = {
-    client: ctx.client,
+    session: ctx.opencode.session,
     userMessages,
-    parentSessionID: permission.sessionID,
+    parentSessionID: ev.sessionID,
     model,
     timeoutMs: ctx.config.classifierTimeoutMs,
     repoContext,
@@ -458,11 +443,11 @@ async function handleSubjectPermission(args: {
     retries: ctx.config.classifierRetries,
     onEphemeralSessionCreated: (id: string, systemPrompt: string) => {
       ctx.ephemeralSessionIDs.add(id)
-      ctx.ephemeralSystemRegistry?.set(id, systemPrompt)
+      ctx.ephemeralSystemRegistry.set(id, systemPrompt)
     },
     onEphemeralSessionDeleted: (id: string) => {
       ctx.ephemeralSessionIDs.delete(id)
-      ctx.ephemeralSystemRegistry?.delete(id)
+      ctx.ephemeralSystemRegistry.delete(id)
     },
   }
 
@@ -475,18 +460,11 @@ async function handleSubjectPermission(args: {
     failureClass = fc
   }
 
-  const verdict =
-    systemPrompt === null
-      ? // Bash path: use the convenience wrapper that supplies the bash prompt.
-        await classifyCommand({ ...commonClassifyArgs, command: subject, onFailure })
-      : // Generic path (e.g. directory): caller supplies the system prompt.
-        await classifySubject({
-          ...commonClassifyArgs,
-          subject,
-          systemPrompt,
-          buildUserPrompt: buildDirectoryClassifierUserPrompt,
-          onFailure,
-        })
+  const verdict = directory
+    ? // Directory path: directory-specific classifier prompt.
+      await classifyDirectory({ ...commonClassifyArgs, path: subject, onFailure })
+    : // Shell path: use the convenience wrapper that supplies the bash prompt.
+      await classifyCommand({ ...commonClassifyArgs, command: subject, onFailure })
 
   if (!verdict) {
     log.warn("classifier failed; leaving TUI prompt alone", {
@@ -495,7 +473,7 @@ async function handleSubjectPermission(args: {
     })
     maybeNotifyClassifierFailure({
       ctx,
-      permission,
+      ev,
       subject,
       failureClass,
       base,
@@ -510,15 +488,15 @@ async function handleSubjectPermission(args: {
   })
 
   // ---- Update pending subject with the verdict ---------------------------
-  ctx.pendingSubjects.update(permission.id, (cur) => ({
+  ctx.pendingSubjects.update(key, (cur) => ({
     ...cur,
     classifierVerdict: verdict.verdict,
     classifierReason: verdict.reason,
   }))
 
   // ---- Directory cache population (SAFE only) ----------------------------
-  if (directoryPatterns && verdict.verdict === "SAFE") {
-    const cacheKey = DirectoryVerdictCache.keyFor(directoryPatterns)
+  if (directory && verdict.verdict === "SAFE") {
+    const cacheKey = DirectoryVerdictCache.keyFor([...ev.resources])
     ctx.directoryVerdictCache.set(
       cacheKey,
       verdict,
@@ -531,9 +509,8 @@ async function handleSubjectPermission(args: {
     verdict,
     subject,
     subjectLabel,
-    permission,
+    ev,
     ctx,
-    output,
     base,
   })
 }
@@ -551,12 +528,12 @@ async function handleSubjectPermission(args: {
  */
 function maybeNotifyClassifierFailure(args: {
   ctx: HandlerContext
-  permission: Permission
+  ev: PermissionEvaluation
   subject: string
   failureClass: ClassifyFailureClass
   base: Record<string, unknown>
 }): void {
-  const { ctx, permission, subject, failureClass, base } = args
+  const { ctx, ev, subject, failureClass, base } = args
   if (!ctx.config.notifyOnClassifierFailure) return
 
   const decision = ctx.failureNotifyRateLimiter.register(
@@ -578,9 +555,7 @@ function maybeNotifyClassifierFailure(args: {
   })
 
   void runFailureNotificationInBackground({
-    client: ctx.client,
-    sessionID: permission.sessionID,
-    permissionID: permission.id,
+    reply: makeReplier(ctx, ev),
     command: subject,
     failureClass,
     suppressedCount: decision.suppressedCount,
@@ -597,12 +572,11 @@ async function runSafeOrRiskyPath(args: {
   verdict: import("../classifier/parse.ts").Verdict
   subject: string
   subjectLabel: "command" | "path"
-  permission: Permission
+  ev: PermissionEvaluation
   ctx: HandlerContext
-  output: HandlerOutput | undefined
   base: Record<string, unknown>
 }): Promise<void> {
-  const { verdict, subject, subjectLabel, permission, ctx, output, base } = args
+  const { verdict, subject, subjectLabel, ev, ctx, base } = args
   const { log } = ctx
 
   if (verdict.verdict === "SAFE") {
@@ -623,21 +597,18 @@ async function runSafeOrRiskyPath(args: {
       log.info("auto-approving", {
         ...base,
         [subjectLabel]: subject,
-        viaOutput: Boolean(output),
       })
-      // Tag the pending entry BEFORE the respond/output call so that even
-      // if the server emits `permission.replied` immediately after, the
-      // replied-event handler sees `autoApproved: true` and filters this
-      // out of the human-decision history.
-      ctx.pendingSubjects.update(permission.id, (cur) => ({
+      // Tag the pending entry BEFORE setting effect so that even if the
+      // server emits `permission.replied` immediately after, the replied-
+      // event handler sees `autoApproved: true` and filters this out of the
+      // human-decision history.
+      ctx.pendingSubjects.update(evaluationKey(ev), (cur) => ({
         ...cur,
         autoApproved: true,
       }))
-      if (output) {
-        output.status = "allow"
-      } else {
-        await respondToPermission(ctx.client, permission, "once", log)
-      }
+      // Auto-approve BEFORE the TUI prompt exists — the V2 evaluate hook's
+      // whole point.
+      ev.effect = "allow"
     } else {
       log.info("user cancelled auto-approval; TUI prompt remains", base)
     }
@@ -647,9 +618,7 @@ async function runSafeOrRiskyPath(args: {
   log.info("risky — escalating via TUI + notification", base)
   // RISKY: fire the notification alongside opencode's TUI prompt.
   void runRiskyPathInBackground({
-    client: ctx.client,
-    sessionID: permission.sessionID,
-    permissionID: permission.id,
+    reply: makeReplier(ctx, ev),
     command: subject,
     reason: verdict.reason,
     sound: ctx.config.notificationSound,
@@ -657,94 +626,129 @@ async function runSafeOrRiskyPath(args: {
   })
 }
 
+// ---------------------------------------------------------------------------
+// Programmatic permission resolution (notification-button replies)
+// ---------------------------------------------------------------------------
+
 /**
- * Call opencode's permission-respond endpoint. Swallows errors — if the
- * response fails, the TUI prompt remains as a fallback for the user.
+ * Build a replier that resolves the pending permission request for `ev` at
+ * reply time and answers it.
+ *
+ * Why lazy: the evaluate hook fires BEFORE opencode has assigned the
+ * permission a request ID (the request may not even exist yet when the
+ * classification fails). Notification buttons are clicked seconds later, by
+ * which time the request is registered — so we look it up then, matching on
+ * sessionID + action + resources. A short retry covers the race where the
+ * request lands between our hook returning and the user clicking.
  */
-async function respondToPermission(
-  client: OpencodeClient,
-  permission: Permission,
-  response: "once" | "always" | "reject",
-  log: Logger,
-): Promise<void> {
-  try {
-    await (
-      client as unknown as {
-        postSessionIdPermissionsPermissionId: (opts: {
-          path: { id: string; permissionID: string }
-          body: { response: "once" | "always" | "reject" }
-        }) => Promise<unknown>
+function makeReplier(
+  ctx: HandlerContext,
+  ev: PermissionEvaluation,
+): (response: "once" | "always" | "reject") => Promise<void> {
+  return async (response) => {
+    const { log } = ctx
+
+    let requestID: string | null = null
+    // A few quick attempts: immediately, then two short backoffs. All
+    // best-effort — total added latency is bounded (~450ms) and only paid
+    // when the user actually clicked a notification button.
+    for (let attempt = 0; attempt < 3 && requestID === null; attempt++) {
+      if (attempt > 0) await sleep(200)
+      try {
+        const requests = await ctx.opencode.permission.list({
+          sessionID: ev.sessionID,
+        })
+        requestID =
+          requests?.find(
+            (r) =>
+              r.sessionID === ev.sessionID &&
+              r.action === ev.action &&
+              sameResources(r.resources, ev.resources),
+          )?.id ?? null
+      } catch (e) {
+        log.warn("permission list failed while resolving request", {
+          error: e instanceof Error ? e.message : String(e),
+        })
       }
-    ).postSessionIdPermissionsPermissionId({
-      path: { id: permission.sessionID, permissionID: permission.id },
-      body: { response },
+    }
+
+    if (requestID === null) {
+      // Fail-closed: don't guess. The TUI prompt remains for the user.
+      log.warn("could not resolve permission requestID; not replying", {
+        permissionAction: ev.action,
+        response,
+      })
+      return
+    }
+
+    await ctx.opencode.permission.reply({
+      sessionID: ev.sessionID,
+      requestID,
+      reply: response,
     })
-    log.info("permission respond succeeded", {
-      permissionID: permission.id,
+    log.info("permission reply succeeded", {
+      permissionAction: ev.action,
+      requestID,
       response,
-    })
-  } catch (e) {
-    // TUI prompt still live as fallback.
-    log.error("permission respond failed", {
-      permissionID: permission.id,
-      response,
-      error: e instanceof Error ? e.message : String(e),
     })
   }
 }
 
+function sameResources(
+  a: ReadonlyArray<string>,
+  b: ReadonlyArray<string>,
+): boolean {
+  if (a.length !== b.length) return false
+  return a.every((v, i) => v === b[i])
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms))
+}
+
+// ---------------------------------------------------------------------------
+// Resource extraction helpers
+// ---------------------------------------------------------------------------
+
 /**
- * Coerce OpenCode's pattern field (string | string[] | undefined — under
- * either the SDK-typed `pattern` key or the runtime `patterns` key) into a
- * single string, taking only the FIRST element of an array. Returns `null`
- * when no usable value is present.
+ * Coerce the resources array into a single string, taking only the FIRST
+ * element. Returns `null` when no usable value is present.
  *
- * Used for the external_directory path, where the array holds independent
+ * Used for the external_directory action, where the array holds independent
  * paths (a burst), not segments of one compound command — there the first
  * element is the representative display subject and the full list drives the
  * cache key separately.
  */
-function extractCommand(
-  pattern: string | string[] | undefined,
+function extractFirstResource(
+  resources: ReadonlyArray<string>,
 ): string | null {
-  if (typeof pattern === "string") {
-    return pattern.length > 0 ? pattern : null
-  }
-  if (Array.isArray(pattern) && pattern.length > 0) {
-    const first = pattern[0]
-    if (typeof first === "string" && first.length > 0) return first
-  }
+  const first = resources[0]
+  if (typeof first === "string" && first.length > 0) return first
   return null
 }
 
 /**
- * Coerce OpenCode's bash pattern field into the FULL command to classify.
+ * Coerce the shell resources array into the FULL command to classify.
  *
- * opencode 1.15.x splits a compound shell command (sub-commands joined by
- * `&&`, `;`, `|`, etc.) into its constituent pieces and delivers them as a
- * `patterns` array — e.g. `git add . && git commit -m x` arrives as
+ * The scanner splits a compound shell command (sub-commands joined by `&&`,
+ * `;`, `|`, etc.) into its constituent pieces and delivers them as the
+ * resources array — e.g. `git add . && git commit -m x` arrives as
  * `["git add .", "git commit -m x"]`. Classifying only the first element
- * (the old behaviour) judged a different, frequently safer command than what
- * actually runs, letting a benign leading segment mask a risky trailing one.
+ * judged a different, frequently safer command than what actually runs,
+ * letting a benign leading segment mask a risky trailing one.
  *
  * We therefore re-join all non-empty segments with ` && ` so the classifier
- * sees the entire command. A single-element array (or a plain string) is
- * returned unchanged. Returns `null` when there is no usable command text.
+ * sees the entire command. A single-element array is returned unchanged.
+ * Returns `null` when there is no usable command text.
  */
 function extractBashCommand(
-  pattern: string | string[] | undefined,
+  resources: ReadonlyArray<string>,
 ): string | null {
-  if (typeof pattern === "string") {
-    return pattern.length > 0 ? pattern : null
-  }
-  if (Array.isArray(pattern)) {
-    const segments = pattern.filter(
-      (p): p is string => typeof p === "string" && p.length > 0,
-    )
-    if (segments.length === 0) return null
-    return segments.join(" && ")
-  }
-  return null
+  const segments = resources.filter(
+    (p): p is string => typeof p === "string" && p.length > 0,
+  )
+  if (segments.length === 0) return null
+  return segments.join(" && ")
 }
 
 /**
@@ -771,10 +775,12 @@ function pickBranch(
 function pickOpenPR(
   repo: DualRepoContext | RepoContext | null,
   side: "pinned" | "current",
-): number | null {
+): string | null {
   if (!repo) return null
   if (isDualRepoContext(repo)) {
-    return repo[side]?.openPR?.number ?? null
+    return repo[side]?.openPR?.number !== undefined
+      ? String(repo[side]?.openPR?.number)
+      : null
   }
-  return side === "current" ? repo.openPR?.number ?? null : null
+  return side === "current" ? (repo.openPR?.number !== undefined ? String(repo.openPR.number) : null) : null
 }

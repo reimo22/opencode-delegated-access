@@ -17,23 +17,16 @@
  * declares `BunShell` internally without re-exporting it, so we re-state
  * just the surface we need.
  *
- * Calling the tag returns a "shell promise" with chainable cwd/quiet/
- * nothrow methods that ultimately resolves to an output object with an
- * `exitCode` and a `text()` accessor.
+/**
+ * Minimal async shell the repo-context code needs. Backed by
+ * `node:child_process.execFile` in src/index.ts (V2 of the plugin API has no
+ * Bun `$` in the plugin context). Each element becomes its own argv slot —
+ * no quoting bugs.
  */
-export type ShellOutput = {
-  exitCode: number
-  text(encoding?: string): string
-}
-export type ShellPromise = Promise<ShellOutput> & {
-  cwd(newCwd: string): ShellPromise
-  quiet(): ShellPromise
-  nothrow(): ShellPromise
-}
 export type BunShellLike = (
-  strings: TemplateStringsArray,
-  ...exprs: unknown[]
-) => ShellPromise
+  cmd: [string, ...string[]],
+  cwd: string,
+) => Promise<{ exitCode: number; stdout: string } | null>
 
 export type RepoContext = {
   /** Current branch name; "(detached)" for detached HEAD. */
@@ -86,12 +79,11 @@ async function runQuiet(
   cwd: string,
   timeoutMs: number = SHELL_TIMEOUT_MS,
 ): Promise<string | null> {
-  const [exe, ...rest] = cmd
   const promise = (async () => {
     try {
-      const result = await $`${exe} ${rest}`.cwd(cwd).quiet().nothrow()
-      if (result.exitCode !== 0) return null
-      return result.text()
+      const result = await $(cmd, cwd)
+      if (!result || result.exitCode !== 0) return null
+      return result.stdout
     } catch {
       return null
     }

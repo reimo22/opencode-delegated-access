@@ -1,11 +1,9 @@
-import type { createOpencodeClient } from "@opencode-ai/sdk"
 import {
   sendNotification as defaultSendNotification,
   type NotifyActionResult,
 } from "../notify/notify.ts"
 import type { ClassifyFailureClass } from "../classifier/classify.ts"
-
-type OpencodeClient = ReturnType<typeof createOpencodeClient>
+import type { PermissionReplier } from "./risky-path.ts"
 
 /** Upper bound on the command string we embed in the notification body. */
 const COMMAND_DISPLAY_MAX = 160
@@ -87,9 +85,7 @@ export class FailureNotifyRateLimiter {
  * still decide in the TUI.
  */
 export async function runFailureNotificationInBackground(args: {
-  client: OpencodeClient
-  sessionID: string
-  permissionID: string
+  reply: PermissionReplier
   command: string
   failureClass: ClassifyFailureClass
   /** How many earlier failures collapsed into this one (0 = none). */
@@ -106,9 +102,7 @@ export async function runFailureNotificationInBackground(args: {
   }) => Promise<NotifyActionResult>
 }): Promise<void> {
   const {
-    client,
-    sessionID,
-    permissionID,
+    reply,
     command,
     failureClass,
     suppressedCount,
@@ -142,17 +136,7 @@ export async function runFailureNotificationInBackground(args: {
   if (result.type !== "action" || result.label !== REJECT_LABEL) return
 
   try {
-    await (
-      client as unknown as {
-        postSessionIdPermissionsPermissionId: (opts: {
-          path: { id: string; permissionID: string }
-          body: { response: "once" | "always" | "reject" }
-        }) => Promise<unknown>
-      }
-    ).postSessionIdPermissionsPermissionId({
-      path: { id: sessionID, permissionID },
-      body: { response: "reject" },
-    })
+    await reply("reject")
   } catch {
     // Swallow — TUI prompt is still live as a fallback.
   }

@@ -1,7 +1,10 @@
-import type { createOpencodeClient, Part } from "@opencode-ai/sdk"
 import {
   CLASSIFIER_SYSTEM_PROMPT,
   buildClassifierUserPrompt,
+} from "./prompt.ts"
+import {
+  DIRECTORY_CLASSIFIER_SYSTEM_PROMPT,
+  buildDirectoryClassifierUserPrompt,
 } from "./prompt.ts"
 import { parseVerdict, type Verdict } from "./parse.ts"
 import type { ModelRef } from "./model.ts"
@@ -9,64 +12,28 @@ import type { RepoContext, DualRepoContext } from "../repo-context.ts"
 import type { ApprovalEntry } from "../permission/approval-history.ts"
 import type { Logger } from "../log.ts"
 
-type OpencodeClient = ReturnType<typeof createOpencodeClient>
+/**
+ * Structural slice of the V2 `ctx.session` domain the classifier needs.
+ * (Structural typing keeps us resilient to minor shape drift — the V2
+ * package root doesn't export domain types directly.)
+ */
+export type ClassifierSession = {
+  create(input: {
+    title?: string
+    model?: { providerID: string; id: string }
+  }): Promise<{ id?: string } | undefined>
+  generate(input: {
+    sessionID: string
+    prompt: string
+  }): Promise<{ text?: string } | undefined>
+  interrupt(input: { sessionID: string }): Promise<unknown>
+}
 
 /**
  * Title for the ephemeral classifier session. Picked to be obvious if a user
  * ever sees one in a session list so they know it's plugin-generated.
  */
 const CLASSIFIER_SESSION_TITLE = "[delegated-access classifier]"
-
-/**
- * Built-in opencode tool names we explicitly deny for the classifier prompt.
- *
- * Why not just `{ "*": false }`? opencode resolves the effective tool set by
- * merging permission rules from the agent default, the project/global
- * `opencode.json`, and the per-prompt `tools` map. The wildcard `"*"` is the
- * LEAST-specific rule, so a user's own allowlist — e.g.
- * `permission.bash["git status"] = "allow"`, `"bun *": "allow"`, `"ls":
- * "allow"` — is MORE specific and overrides the wildcard deny, re-enabling
- * tools for the classifier. That is exactly the regression observed on
- * opencode 1.15.x: the ephemeral classifier session resolved the full
- * registry and ran a multi-step agentic tool loop instead of returning a
- * one-shot verdict, so no parseable `VERDICT:` line was ever produced and
- * every classification failed closed.
- *
- * Denying each tool BY NAME gives our deny the same specificity as a user's
- * by-name allow, so a tool can't be re-enabled out from under us. We keep the
- * `"*": false` wildcard too as a catch-all for any tool not in this list
- * (custom/MCP/plugin tools). New built-in tools added upstream are still
- * covered by the wildcard; this list just hardens the common ones a user is
- * most likely to have allow-listed.
- */
-const DENIED_TOOL_NAMES = [
-  "bash",
-  "edit",
-  "write",
-  "read",
-  "glob",
-  "grep",
-  "list",
-  "patch",
-  "todowrite",
-  "todoread",
-  "webfetch",
-  "task",
-  "question",
-  "skill",
-  "invalid",
-] as const
-
-/**
- * Build the per-prompt `tools` deny map: `"*": false` plus an explicit
- * `false` for every name in {@link DENIED_TOOL_NAMES}. See that constant's
- * doc comment for why the by-name entries are load-bearing.
- */
-function buildToolDenyMap(): Record<string, boolean> {
-  const map: Record<string, boolean> = { "*": false }
-  for (const name of DENIED_TOOL_NAMES) map[name] = false
-  return map
-}
 
 /**
  * Run the safety classifier for a permission subject (a bash command, a
@@ -76,25 +43,34 @@ function buildToolDenyMap(): Record<string, boolean> {
  * function remains agnostic about what is being classified.
  *
  * Flow:
- *   1. Create an ephemeral child session (hidden from top-level lists via
- *      `parentID: <caller's sessionID>`).
- *   2. Call `session.prompt` with the classifier model, the caller-supplied
- *      system prompt, `tools: { "*": false }` (deny all tools), and the user
- *      prompt built from the subject + recent user messages.
- *   3. Parse the response's text parts with {@link parseVerdict}.
- *   4. Always delete the ephemeral session in a `finally` block (errors
- *      swallowed — cleanup is best-effort).
+ *   1. Create an ephemeral session with the classifier model attached.
+ *      NOTE (V2): the plugin-facing session domain exposes no `parentID` on
+ *      create and no `remove` — the session is top-level (identifiable by
+ *      its title) and is NOT deleted after use. Sessions are cheap and
+ *      clearly labelled; the loop-guard still tracks their IDs.
+ *   2. The system prompt and tool-deny are enforced by the caller's
+ *      `session.hook("context")` handler (registered in src/index.ts), which
+ *      rewrites `system` to just the registered classifier prompt and clears
+ *      `tools` for sessions tracked in the ephemeral registry. This is
+ *      stronger than V1's per-prompt `tools` map: it runs in-process at
+ *      request-assembly time and can't be overridden by user permission
+ *      allowlists.
+ *   3. Call `session.generate` with the user prompt built from the subject +
+ *      recent user messages, parse the text with {@link parseVerdict}.
+ *   4. On timeout, interrupt the session and treat the attempt as failed
+ *      (fail-closed — a partial response is NEVER trusted).
  *
  * Fail-closed behaviour: returns `null` for any error, malformed response,
  * or timeout exceeding `timeoutMs`. Callers should treat `null` as "classifier
  * failure → fall back to the normal opencode approval prompt".
  */
 export async function classifySubject(args: {
-  client: OpencodeClient
+  session: ClassifierSession
   /** The string being classified (command, path pattern, etc.). */
   subject: string
   /** Recent human-authored messages to give the classifier context. */
   userMessages: string[]
+  /** Session ID the permission originated from (for logging/context only). */
   parentSessionID: string
   model: ModelRef
   timeoutMs: number
@@ -130,16 +106,16 @@ export async function classifySubject(args: {
   /**
    * Called with the ephemeral classifier session's ID AND the system prompt
    * that session will use, as soon as the session is created. Callers track
-   * the ID to filter out downstream `permission.asked` events the classifier
-   * session might generate (loop-guard), and register the system prompt for
-   * the `experimental.chat.system.transform` isolation hook (so the global
-   * agent preamble/instructions are stripped from the classifier prompt).
+   * the ID to filter out downstream permission events the classifier session
+   * might generate (loop-guard), and register the system prompt for the
+   * `session.hook("context")` isolation handler (so the global agent
+   * preamble/instructions are stripped from the classifier prompt and its
+   * tools are denied).
    */
   onEphemeralSessionCreated?: (id: string, systemPrompt: string) => void
   /**
-   * Called with the ephemeral session's ID after deletion completes (or
-   * fails — cleanup is best-effort). Callers should clear the session ID
-   * from their tracking set here.
+   * Called with the ephemeral session's ID when the attempt finishes.
+   * Callers should clear the session ID from their tracking set here.
    */
   onEphemeralSessionDeleted?: (id: string) => void
   /**
@@ -148,7 +124,7 @@ export async function classifySubject(args: {
    * verdict) emits an actionable log line so an upstream API break isn't
    * silently swallowed by the fail-closed `catch`. When omitted, failures
    * are silent (preserves the historical behaviour for callers that don't
-   * pass a logger, e.g. older tests).
+   * pass a logger).
    */
   log?: Logger
   /**
@@ -226,10 +202,10 @@ Classify the original subject again now.
 </format_correction>`
 
 /**
- * A single classifier attempt: create an ephemeral session, prompt with a
- * timeout, parse the verdict, clean up. Returns a discriminated outcome so
- * the caller's retry loop can distinguish a retryable timeout from a final
- * error. Never throws.
+ * A single classifier attempt: create an ephemeral session, generate with a
+ * timeout, parse the verdict. Returns a discriminated outcome so the caller's
+ * retry loop can distinguish a retryable timeout from a final error. Never
+ * throws.
  */
 async function classifyOnce(
   args: Parameters<typeof classifySubject>[0],
@@ -243,7 +219,7 @@ async function classifyOnce(
   correctFormat = false,
 ): Promise<ClassifyOutcome> {
   const {
-    client,
+    session,
     subject,
     userMessages,
     parentSessionID,
@@ -257,17 +233,16 @@ async function classifyOnce(
     onEphemeralSessionDeleted,
     log,
   } = args
+  void parentSessionID
 
-  // Step 1: create ephemeral child session.
+  // Step 1: create ephemeral session with the classifier model attached.
   let ephemeralID: string | undefined
   try {
-    const created = await client.session.create({
-      body: {
-        parentID: parentSessionID,
-        title: CLASSIFIER_SESSION_TITLE,
-      },
-    } as never)
-    ephemeralID = (created as { data?: { id?: string } }).data?.id
+    const created = await session.create({
+      title: CLASSIFIER_SESSION_TITLE,
+      model: { providerID: model.providerID, id: model.modelID },
+    })
+    ephemeralID = created?.id
   } catch (e) {
     log?.error("classifier: ephemeral session.create threw", {
       error: e instanceof Error ? e.message : String(e),
@@ -293,44 +268,25 @@ async function classifyOnce(
       ? baseUserPrompt + FORMAT_CORRECTION_INSTRUCTION
       : baseUserPrompt
 
-    const promptCall = client.session.prompt({
-      path: { id: ephemeralID },
-      body: {
-        model,
-        system: systemPrompt,
-        // Deny ALL tools for this prompt. A bare `{ "*": false }` is NOT
-        // enough on opencode 1.15.x: the wildcard is the least-specific
-        // permission rule, so a user's by-name allowlist (e.g.
-        // `permission.bash["ls"] = "allow"`) overrides it and re-enables
-        // tools, making the classifier loop on tool calls instead of
-        // answering. We therefore deny each built-in tool by name too (same
-        // specificity as a user allow). See `buildToolDenyMap`.
-        tools: buildToolDenyMap(),
-        parts: [{ type: "text", text: userPrompt }],
-      },
-    } as never)
+    const generateCall = session.generate({
+      sessionID: ephemeralID,
+      prompt: userPrompt,
+    })
 
-    const response = (await withTimeout(promptCall, timeoutMs, async () => {
-      // Flip the gate BEFORE awaiting abort so that if the prompt promise
-      // settles during the abort call (a race observed on opencode 1.4.x
-      // where the server flushes pre-abort stream chunks on cancel), the
-      // post-race fail-closed check below can still discard it.
+    const response = await withTimeout(generateCall, timeoutMs, async () => {
       timedOut = true
-      // Await the abort so opencode's session.processor has a chance to
-      // stop streaming BEFORE the finally-block deletes the session. If we
-      // skip this wait, the still-streaming LLM response can race the
-      // delete and surface a "Session not found" error toast in the TUI.
+      // Await the interrupt so the in-flight generation is actually stopped
+      // before we finish. Best-effort.
       try {
-        await client.session.abort({ path: { id: ephemeralID! } } as never)
+        await session.interrupt({ sessionID: ephemeralID! })
       } catch {
-        // Abort is best-effort; the post-abort settle delay still protects
-        // us from the common races.
+        // Interrupt is best-effort.
       }
-    })) as { data?: { parts?: Part[] } } | null
+    })
 
     // Fail-closed gate: if the timeout fired at ANY point during the race,
-    // discard whatever the prompt promise returned. Partial pre-abort
-    // streams have been observed to contain well-formed "VERDICT: SAFE"
+    // discard whatever the prompt promise returned. Partial pre-interrupt
+    // responses have been observed to contain well-formed "VERDICT: SAFE"
     // text that would otherwise auto-approve a command whose classification
     // never actually completed — violating the plugin's fail-closed
     // contract (see README "How it's safe").
@@ -344,13 +300,13 @@ async function classifyOnce(
       return { kind: "timeout" }
     }
 
-    if (!response) {
+    if (!response || typeof response.text !== "string" || response.text.length === 0) {
       log?.warn("classifier: prompt returned no response (fail-closed)", {})
       return { kind: "error" }
     }
 
     // Step 3: parse.
-    const text = responseTextFromParts(response.data?.parts ?? [])
+    const text = response.text
     const verdict = parseVerdict(text)
     if (!verdict) {
       // Surface the raw model text (truncated) so an output-format break —
@@ -361,7 +317,6 @@ async function classifyOnce(
       log?.warn("classifier: response did not parse to a verdict (malformed)", {
         rawTextPreview: text.slice(0, 500),
         rawTextLength: text.length,
-        partCount: response.data?.parts?.length ?? 0,
         attempt,
         maxAttempts,
         willRetry: attempt < maxAttempts,
@@ -376,17 +331,11 @@ async function classifyOnce(
     })
     return { kind: "error" }
   } finally {
-    // Step 4: best-effort cleanup. On the timeout path, give the server a
-    // brief moment to fully quiesce the aborted stream before we delete —
-    // without this grace window, late LLM chunks arriving at the deleted
-    // session surface as a "Session not found" error toast in the TUI.
+    // Step 4: the V2 plugin session domain exposes no session-remove, so the
+    // ephemeral session is left in place (clearly titled, interrupted if it
+    // timed out). Drop it from the caller's tracking set.
     if (timedOut) {
       await sleep(POST_ABORT_SETTLE_MS)
-    }
-    try {
-      await client.session.delete({ path: { id: ephemeralID } } as never)
-    } catch {
-      // Swallow — cleanup must not affect the returned verdict.
     }
     onEphemeralSessionDeleted?.(ephemeralID)
   }
@@ -418,22 +367,37 @@ export function classifyCommand(
   })
 }
 
-/** Grace period between aborting a timed-out prompt and deleting the session. */
+/**
+ * Convenience wrapper around {@link classifySubject} for external-directory
+ * permissions: supplies the directory-specific system prompt and user-prompt
+ * builder.
+ */
+export function classifyDirectory(
+  args: Omit<
+    Parameters<typeof classifySubject>[0],
+    "subject" | "systemPrompt" | "buildUserPrompt"
+  > & { path: string },
+): ReturnType<typeof classifySubject> {
+  const { path, ...rest } = args
+  return classifySubject({
+    ...rest,
+    subject: path,
+    systemPrompt: DIRECTORY_CLASSIFIER_SYSTEM_PROMPT,
+    buildUserPrompt: ({ subject, userMessages, repoContext, priorApprovals }) =>
+      buildDirectoryClassifierUserPrompt({
+        subject,
+        userMessages,
+        repoContext: repoContext ?? null,
+        priorApprovals: priorApprovals ?? [],
+      }),
+  })
+}
+
+/** Grace period between interrupting a timed-out prompt and moving on. */
 const POST_ABORT_SETTLE_MS = 250
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms))
-}
-
-/**
- * Concatenate all text parts of a session.prompt response into a single
- * string for the parser to inspect. Non-text parts are ignored.
- */
-function responseTextFromParts(parts: Part[]): string {
-  return parts
-    .filter((p): p is Part & { type: "text"; text: string } => p.type === "text")
-    .map((p) => p.text)
-    .join("")
 }
 
 /**

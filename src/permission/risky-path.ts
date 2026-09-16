@@ -1,7 +1,14 @@
-import type { createOpencodeClient } from "@opencode-ai/sdk"
 import { sendNotification } from "../notify/notify.ts"
 
-type OpencodeClient = ReturnType<typeof createOpencodeClient>
+/**
+ * Programmatic permission resolver injected by the caller. Resolves the
+ * pending permission request (finding its requestID via the permission
+ * domain, matching session/action/resources) and replies to it. Swallows
+ * its own errors — the TUI prompt remains as a fallback.
+ */
+export type PermissionReplier = (
+  response: "once" | "always" | "reject",
+) => Promise<void>
 
 /** Upper bound on the command string we embed in the notification body. */
 const COMMAND_DISPLAY_MAX = 180
@@ -14,36 +21,33 @@ const REJECT_LABEL = "Reject"
  * Drive the RISKY-path notification _in the background_, alongside opencode's
  * normal TUI permission prompt.
  *
- * Called AFTER the plugin's `permission.ask` hook has already resolved with
- * `output.status = "ask"`, so opencode is already showing its in-TUI prompt.
+ * Called AFTER the plugin's permission evaluate hook has resolved with
+ * "ask" (no override), so opencode is already showing its in-TUI prompt.
  * This function fires and awaits the notification independently:
  *
- *   - If the user clicks **Approve** in the notification, we call the SDK to
- *     resolve the permission with `response: "once"` — this closes the TUI
- *     prompt programmatically and opencode proceeds with the command.
- *   - If they click **Reject**, we call the SDK with `response: "reject"` —
+ *   - If the user clicks **Approve** in the notification, we resolve the
+ *     permission with `response: "once"` via the injected replier — this
+ *     closes the TUI prompt programmatically and opencode proceeds.
+ *   - If they click **Reject**, we resolve with `response: "reject"` —
  *     same deal, but opencode blocks the command.
  *   - Any other outcome (timeout, cancel, body click, notifier error, unknown
  *     action label) is a no-op: the TUI prompt is still live and the user
  *     can respond there as normal.
  *
- * SDK errors are swallowed — the TUI prompt remains as a fallback, so a
- * transient SDK failure doesn't leave the user stranded.
+ * Replier errors are swallowed — the TUI prompt remains as a fallback, so a
+ * transient failure doesn't leave the user stranded.
  *
  * This function is expected to be called with fire-and-forget semantics; it
  * never returns anything useful and never throws.
  */
 export async function runRiskyPathInBackground(args: {
-  client: OpencodeClient
-  sessionID: string
-  permissionID: string
+  reply: PermissionReplier
   command: string
   reason: string
   sound: boolean
   timeoutSec: number
 }): Promise<void> {
-  const { client, sessionID, permissionID, command, reason, sound, timeoutSec } =
-    args
+  const { reply, command, reason, sound, timeoutSec } = args
 
   const displayCmd =
     command.length > COMMAND_DISPLAY_MAX
@@ -69,17 +73,7 @@ export async function runRiskyPathInBackground(args: {
 
   try {
     // Resolve the permission programmatically; this closes the TUI prompt.
-    await (
-      client as unknown as {
-        postSessionIdPermissionsPermissionId: (opts: {
-          path: { id: string; permissionID: string }
-          body: { response: "once" | "always" | "reject" }
-        }) => Promise<unknown>
-      }
-    ).postSessionIdPermissionsPermissionId({
-      path: { id: sessionID, permissionID },
-      body: { response },
-    })
+    await reply(response)
   } catch {
     // Swallow — TUI prompt is still live as a fallback.
   }

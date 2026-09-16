@@ -1,14 +1,14 @@
 {
   "name": "opencode-delegated-access",
-  "version": "0.4.0",
-  "description": "OpenCode plugin that auto-approves safe bash commands via an LLM safety classifier and escalates risky ones with an OS notification.",
+  "version": "0.5.0-v2",
+  "description": "OpenCode plugin that auto-approves safe shell commands via an LLM safety classifier and escalates risky ones with an OS notification.",
   "type": "module",
   "main": "./src/index.ts",
   "exports": {
     ".": "./src/index.ts"
   },
   "scripts": {
-    "check": "tsc --noEmit",
+    "check": "tsc --noEmit -p tsconfig.check.json",
     "test": "vitest run",
     "test:watch": "vitest"
   },
@@ -21,8 +21,7 @@
   ],
   "license": "MIT",
   "dependencies": {
-    "@opencode-ai/plugin": "latest",
-    "@opencode-ai/sdk": "latest",
+    "@opencode/plugin": "^2.0.4",
     "node-notifier": "^10.0.1",
     "zod": "^3.25.76"
   },

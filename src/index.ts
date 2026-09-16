@@ -1,10 +1,11 @@
-import type { Plugin } from "@opencode-ai/plugin"
-import type { Permission } from "@opencode-ai/sdk"
+import { execFile } from "child_process"
+import { Plugin } from "@opencode/plugin"
 import { parseConfig, type DelegatedAccessConfig } from "./config.ts"
 import {
   handlePermissionEvent,
+  evaluationKey,
   type HandlerContext,
-  type HandlerOutput,
+  type OpencodeAccess,
 } from "./permission/handler.ts"
 import { DirectoryVerdictCache } from "./permission/directory-cache.ts"
 import { SafePathBatcher } from "./permission/safe-path-batcher.ts"
@@ -13,7 +14,6 @@ import { PendingSubjectsMap } from "./permission/pending-subjects.ts"
 import { FailureNotifyRateLimiter } from "./permission/failure-notify.ts"
 import {
   EphemeralSystemRegistry,
-  applyEphemeralSystemTransform,
 } from "./classifier/ephemeral-system.ts"
 import { sendNotification } from "./notify/notify.ts"
 import type { ModelRef } from "./classifier/model.ts"
@@ -26,78 +26,339 @@ import {
 import { SessionRepoContext } from "./session-repo-context.ts"
 
 /**
- * Normalise the `properties` payload of a `permission.replied` event
- * into the SDK-declared canonical shape `{ sessionID, permissionID,
- * response }`.
+ * OpenCode V2 plugin entry point.
  *
- * Why this exists: opencode 1.4.x's SDK type declarations claim the
- * runtime emits `{ sessionID, permissionID, response }`, but the actual
- * runtime emits `{ sessionID, requestID, reply }` — same SDK/runtime
- * drift pattern we already handle for `permission.updated` permission
- * shapes (see `src/permission/handler.ts`'s `runtimeShape` adapter).
- * Without this normaliser, every TUI/notification approval was being
- * silently dropped with a `permission.replied: malformed event
- * properties` warning, and the entire approval-history capture path was
- * a no-op in production.
+ * Hook wiring (V2 of the plugin API):
  *
- * Returns `null` for inputs that can't be coerced to the canonical
- * shape (missing sessionID, neither permissionID nor requestID, neither
- * response nor reply, or non-object input). The caller should treat
- * `null` as "malformed; log and skip."
+ *   1. `permission.hook("evaluate")` — fires BEFORE the TUI prompt exists.
+ *      We classify the subject; on SAFE (after the countdown) we set
+ *      `ev.effect = "allow"` to auto-approve with no flash. Everything is
+ *      fail-closed: any error or uncertainty leaves `effect` untouched and
+ *      the human decides in the TUI.
+ *   2. `session.hook("context")` — for OUR ephemeral classifier sessions
+ *      only, replace the assembled `system` array with just the registered
+ *      classifier prompt and clear `tools` entirely. (V1 used the
+ *      `experimental.chat.system.transform` hook + a per-prompt tools map;
+ *      the context hook replaces both and is stronger — a user allowlist
+ *      can't re-enable tools for the classifier.)
+ *   3. `event.subscribe()` — consumed in the background for
+ *      `permission.replied`, feeding the approval-history store.
  *
- * SDK keys win when both shapes are present, so that a future opencode
- * release switching to the canonical shape doesn't get mis-routed if it
- * also accidentally sets the legacy fields.
+ * All diagnostic output goes through the console-backed logger; opencode
+ * captures plugin stdout/stderr into its log file. Grep with:
+ *
+ *     grep delegated-access ~/.local/share/opencode/log/*.log
+ *
+ * Plugin config: per-plugin tuple options in opencode.json (parsed by
+ * parseConfig; invalid shapes fall back to defaults silently rather than
+ * crashing opencode).
  */
-export function normalizeRepliedProperties(
-  raw: unknown,
-): { sessionID: string; permissionID: string; response: string } | null {
-  if (!raw || typeof raw !== "object") return null
+const DelegatedAccess = Plugin.define({
+  id: "opencode-delegated-access",
+  async setup(ctx) {
+    const directory = ctx.location.directory
+    const log: Logger = createLogger()
+    log.info("plugin loaded")
 
-  const r = raw as {
-    sessionID?: unknown
-    permissionID?: unknown
-    response?: unknown
-    requestID?: unknown
-    reply?: unknown
-  }
+    // V2 exposes no Bun `$`; repo-context shells out through a tiny
+    // execFile shim (argv-slot safe, non-zero exit → non-zero exitCode).
+    const shell: BunShellLike = (cmd, cwd) =>
+      new Promise((resolve) => {
+        execFile(
+          cmd[0],
+          cmd.slice(1),
+          { cwd, timeout: 15_000 },
+          (err, stdout) => {
+            if (err && (err as NodeJS.ErrnoException).code === "ENOENT") {
+              resolve(null) // binary missing (e.g. gh not installed)
+              return
+            }
+            resolve({
+              exitCode: err && typeof (err as { code?: unknown }).code === "number"
+                ? ((err as { code: number }).code as number)
+                : err
+                  ? 1
+                  : 0,
+              stdout: typeof stdout === "string" ? stdout : "",
+            })
+          },
+        )
+      })
 
-  if (typeof r.sessionID !== "string") return null
+    // Live repo-context cache: branch + open PR (via gh) — refreshed on a
+    // short TTL so the classifier always has an up-to-date view of where
+    // the agent thinks it is. Keyed by cwd (in practice always `directory`).
+    const repoContextCache = new RepoContextCache({
+      $: shell,
+    })
 
-  const permissionID =
-    typeof r.permissionID === "string"
-      ? r.permissionID
-      : typeof r.requestID === "string"
-        ? r.requestID
-        : null
-  if (permissionID === null) return null
+    // Session-pinned repo context: captured exactly once (lazily on the
+    // first permission event) and frozen for the lifetime of the plugin
+    // process. Compared against the live `repoContextCache` so the
+    // classifier can detect when the agent has moved off the human's
+    // pre-committed branch/PR.
+    // Share the live cache's fetcher so the first permission event only
+    // pays for ONE git+gh round-trip — the session pin reads through the
+    // cache's first-call result and freezes it forever, while the cache
+    // continues refreshing it on its normal TTL.
+    const sessionRepoContext = new SessionRepoContext({
+      worktree: directory,
+      fetcher: (cwd) => repoContextCache.get(cwd),
+    })
 
-  const response =
-    typeof r.response === "string"
-      ? r.response
-      : typeof r.reply === "string"
-        ? r.reply
-        : null
-  if (response === null) return null
+    // Track whether we've already logged a "repo context unavailable" line
+    // so we don't spam the log on every permission event when gh is missing.
+    let loggedRepoContextUnavailable = false
 
-  return { sessionID: r.sessionID, permissionID, response }
-}
+    async function getRepoContext(): Promise<DualRepoContext> {
+      const [pinned, current] = await Promise.all([
+        sessionRepoContext.getPinned(),
+        repoContextCache.get(directory),
+      ])
+      if (
+        pinned === null &&
+        current === null &&
+        !loggedRepoContextUnavailable
+      ) {
+        log.info("repo context unavailable", { worktree: directory })
+        loggedRepoContextUnavailable = true
+      }
+      return { pinned, current }
+    }
+
+    // Config is resolved at setup time from the per-plugin tuple options.
+    let config: DelegatedAccessConfig
+    try {
+      config = parseConfig(ctx.options)
+      log.info("config resolved", {
+        source: ctx.options !== undefined ? "tuple" : "defaults",
+        enabled: config.enabled,
+        contextMessageCount: config.contextMessageCount,
+        safeCountdownMs: config.safeCountdownMs,
+        classifierTimeoutMs: config.classifierTimeoutMs,
+        classifierRetries: config.classifierRetries,
+        classifierModel: config.classifierModel,
+        externalDirectoryEnabled: config.externalDirectoryEnabled,
+        directoryVerdictCacheTtlMs: config.directoryVerdictCacheTtlMs,
+        approvalHistoryEnabled: config.approvalHistoryEnabled,
+        approvalHistoryMax: config.approvalHistoryMax,
+        notifyOnClassifierFailure: config.notifyOnClassifierFailure,
+        classifierFailureNotifyCooldownMs: config.classifierFailureNotifyCooldownMs,
+      })
+    } catch (e) {
+      config = parseConfig(undefined)
+      log.warn("invalid plugin options; using defaults", {
+        error: e instanceof Error ? e.message : String(e),
+      })
+    }
+
+    // Optional "model": "provider/model-id" tuple option used as the
+    // classifier's fallback model before the latest-assistant-message
+    // heuristic. (V1 latched the session's configured model from the config
+    // hook; V2 exposes no equivalent, so the transcript heuristic covers it.)
+    const sessionModel: ModelRef | undefined =
+      parseModelString(
+        (ctx.options as { model?: unknown } | undefined)?.model,
+      ) ?? undefined
+
+    // Track IDs of ephemeral classifier sessions we create. All permission
+    // evaluations skip events whose `sessionID` is in this set, so the
+    // classifier can't trigger itself (defense-in-depth — the context hook
+    // also clears its tools entirely).
+    const ephemeralSessionIDs = new Set<string>()
+
+    // Maps each ephemeral classifier session ID to the system prompt it should
+    // use. Read by the `session.hook("context")` handler below to REPLACE
+    // opencode's global agent preamble/instructions for the classifier prompt
+    // (otherwise the classifier inherits e.g. the superpowers "you MUST invoke
+    // the skill" directive and replies conversationally instead of emitting a
+    // VERDICT — observed as repeated parse failures in production).
+    const ephemeralSystemRegistry = new EphemeralSystemRegistry()
+
+    // Shared TTL cache for recent SAFE external_directory verdicts. Held at
+    // plugin lifetime (not per-session) so burst deduplication works across
+    // rapid-fire permission events on the same session.
+    const directoryVerdictCache = new DirectoryVerdictCache()
+
+    // Per-plugin-lifetime store of recent human approval/rejection decisions
+    // scoped by root session ID. Surfaced to the classifier as prior-decision
+    // evidence; written by the `permission.replied` event handler when the
+    // human actually resolves a permission.
+    const approvalHistory = new ApprovalHistoryStore({
+      maxPerSession: config.approvalHistoryMax,
+    })
+
+    // Short-lived map of `evaluationKey → { rootSessionID, subject, ... }`
+    // that bridges the gap between the rich subject info seen at evaluation
+    // time and the `permission.replied` event (which carries only the
+    // requestID — resolved back to a key via the permission list).
+    const pendingSubjects = new PendingSubjectsMap()
+
+    // Shared batcher for SAFE-path notifications. A single instance means all
+    // concurrent permission events funnel through the same 200ms batch window,
+    // so bursts (e.g. agent accessing 3 sub-directories at once) produce one
+    // desktop notification instead of N notifications that cancel each other.
+    const safePathBatcher = new SafePathBatcher({
+      batchWindowMs: 200,
+      sendNotification,
+      countdownMs: config.safeCountdownMs,
+      sound: config.notificationSound,
+      log,
+    })
+
+    // Shared, plugin-lifetime rate limiter for classifier-failure
+    // notifications. Held here (not per-session) so a burst of failures across
+    // rapid permission events collapses into a single notification.
+    const failureNotifyRateLimiter = new FailureNotifyRateLimiter({
+      cooldownMs: config.classifierFailureNotifyCooldownMs,
+    })
+
+    // V2 domain slices handed to the handler. The branded-ID types on the
+    // real domains don't structurally match plain strings, but the runtime
+    // shapes are exactly these (verified against @opencode/client 2.0.3).
+    const opencode = {
+      session: ctx.session,
+      permission: ctx.permission,
+    } as unknown as OpencodeAccess
+
+    function buildCtx(): HandlerContext {
+      return {
+        opencode,
+        config,
+        sessionModel,
+        ephemeralSessionIDs,
+        directoryVerdictCache,
+        approvalHistory,
+        pendingSubjects,
+        safePathBatcher,
+        failureNotifyRateLimiter,
+        ephemeralSystemRegistry,
+        log,
+        getRepoContext,
+      }
+    }
+
+    // --- Hook 1: permission evaluation (pre-prompt interception) ------------
+    await ctx.permission.hook("evaluate", async (ev) => {
+      // Loop-guard: skip evaluations from our own ephemeral classifier
+      // sessions.
+      if (ephemeralSessionIDs.has(ev.sessionID)) {
+        log.debug("skip: ephemeral classifier session", {
+          permissionAction: ev.action,
+        })
+        return
+      }
+
+      log.info("permission evaluate fired", {
+        permissionAction: ev.action,
+        resources: ev.resources as unknown,
+        effect: ev.effect,
+      })
+
+      try {
+        await handlePermissionEvent(ev, buildCtx())
+      } catch (e) {
+        // Fail-closed: an exception must never auto-approve OR break the
+        // prompt. Leave `ev.effect` untouched and log.
+        log.error("handler threw", {
+          permissionAction: ev.action,
+          error: e instanceof Error ? e.message : String(e),
+        })
+      }
+    })
+
+    // --- Hook 2: session context isolation for ephemeral classifier sessions
+    // (system prompt replacement + total tool denial). Registered for ALL
+    // sessions but a no-op for every session not in the ephemeral registry.
+    await ctx.session.hook("context", (ev) => {
+      if (!ephemeralSessionIDs.has(ev.sessionID)) return
+      const systemPrompt = ephemeralSystemRegistry.get(ev.sessionID)
+      if (systemPrompt === undefined) return
+      ev.system = [{ type: "text", text: systemPrompt }]
+      ev.tools = {}
+      log.debug("classifier context isolated", { sessionID: ev.sessionID })
+    })
+
+    // --- Hook 3: permission.replied → approval history -----------------------
+    const repliedEvents = await ctx.event.subscribe()
+    void (async () => {
+      for await (const event of repliedEvents) {
+        const type = (event as { type?: unknown }).type
+        if (type !== "permission.replied") continue
+
+        const data = (event as { data?: unknown }).data
+        const normalized = normalizeRepliedProperties(data)
+        if (normalized === null) {
+          log.warn("permission.replied: malformed event data", {
+            data: data as unknown,
+          })
+          continue
+        }
+
+        // Resolve the request back to its action + resources so we can build
+        // the pending-subject key. The request may already be gone (resolved)
+        // — history capture is best-effort, same as V1.
+        let action: string | null = null
+        let resources: string[] = []
+        try {
+          const requests = await ctx.permission.list({
+            sessionID: normalized.sessionID,
+          })
+          const req = requests?.find((r) => r.id === normalized.permissionID)
+          if (req) {
+            action = req.action
+            resources = [...req.resources]
+          }
+        } catch (e) {
+          log.warn("permission.replied: list failed", {
+            error: e instanceof Error ? e.message : String(e),
+          })
+        }
+        if (action === null) {
+          log.debug(
+            "permission.replied: request no longer listed; skipping history",
+            { requestID: normalized.permissionID },
+          )
+          continue
+        }
+
+        handlePermissionReplied(
+          {
+            sessionID: normalized.sessionID,
+            response: normalized.response,
+            key: evaluationKey({
+              sessionID: normalized.sessionID,
+              action,
+              resources,
+            }),
+          },
+          {
+            pendingSubjects,
+            approvalHistory,
+            config,
+            log,
+          },
+        )
+      }
+    })().catch((e) => {
+      log.error("replied-event loop crashed", {
+        error: e instanceof Error ? e.message : String(e),
+      })
+    })
+  },
+})
 
 /**
  * Pure handler for `permission.replied` events. Looks up the matching
- * pending subject (set by the permission.updated path), filters out our
- * own auto-approvals, and appends a human-decision entry to the
- * approval history.
- *
- * Exported so unit tests can exercise it without spinning up the full
- * plugin factory. The plugin's `event` hook delegates to this on
- * `event.type === "permission.replied"`.
+ * pending subject (set by the evaluate path), filters out our own
+ * auto-approvals, and appends a human-decision entry to the approval
+ * history.
  */
-export function handlePermissionReplied(
+function handlePermissionReplied(
   properties: {
     sessionID: string
-    permissionID: string
     response: string
+    key: string
   },
   deps: {
     pendingSubjects: PendingSubjectsMap
@@ -112,22 +373,22 @@ export function handlePermissionReplied(
 
   if (!config.approvalHistoryEnabled) {
     log.debug("permission.replied: history disabled", {
-      permissionID: properties.permissionID,
+      key: properties.key,
     })
     return
   }
 
-  const pending = pendingSubjects.take(properties.permissionID)
+  const pending = pendingSubjects.take(properties.key)
   if (!pending) {
-    log.debug("permission.replied: no pending subject for permissionID", {
-      permissionID: properties.permissionID,
+    log.debug("permission.replied: no pending subject for key", {
+      key: properties.key,
     })
     return
   }
 
   if (pending.autoApproved) {
     log.debug("permission.replied: skipping our own auto-approval", {
-      permissionID: properties.permissionID,
+      key: properties.key,
       subject: pending.subject,
     })
     return
@@ -136,7 +397,7 @@ export function handlePermissionReplied(
   const response = properties.response
   if (response !== "once" && response !== "always" && response !== "reject") {
     log.warn("permission.replied: unrecognised response value", {
-      permissionID: properties.permissionID,
+      key: properties.key,
       response,
     })
     return
@@ -146,7 +407,7 @@ export function handlePermissionReplied(
     // Human resolved before classifier returned — still record, but with
     // a clear marker that we have no classifier verdict to associate.
     log.info("permission.replied: human resolved before classifier", {
-      permissionID: properties.permissionID,
+      key: properties.key,
       response,
     })
   }
@@ -164,416 +425,64 @@ export function handlePermissionReplied(
 
   log.info("recorded human approval decision", {
     rootSessionID: pending.rootSessionID,
-    permissionID: properties.permissionID,
     response,
     subject: pending.subject,
   })
 }
 
 /**
- * OpenCode plugin entry point.
+ * Normalise the data payload of a `permission.replied` event into
+ * `{ sessionID, permissionID, response }`.
  *
- * We register THREE permission-related hooks as a "shotgun" strategy for
- * maximum compatibility with opencode's evolving plugin runtime:
- *
- *   1. `permission.ask` — typed in the SDK. If opencode dispatches it,
- *      this hook gets `output.status` and can pre-empt the TUI prompt
- *      entirely (no flash). Forward-compat for future opencode releases.
- *   2. `permission.updated` — the hook notification.js uses successfully
- *      on 1.4.x. Fires reliably after the TUI prompt is already shown.
- *   3. `event` filtered to `permission.asked` / `permission.updated` —
- *      belt-and-suspenders in case the above two both fail to dispatch.
- *
- * A shared `handledPermissionIDs` set dedupes across all three hooks so
- * each permission is classified exactly once regardless of how many hooks
- * fire for it.
- *
- * All diagnostic output goes through `client.app.log` (service
- * `delegated-access`). Grep the opencode log file to see it:
- *
- *     grep service=delegated-access ~/.local/share/opencode/log/*.log
- *
- * This bypasses the TUI prompt-bar sink that otherwise hides plugin
- * console output behind permission UIs.
- *
- * Plugin config: schema-blessed per-plugin tuple form in opencode.json:
- *
- *     "plugin": [
- *       ["opencode-delegated-access@git+...", {
- *         "enabled": true,
- *         "safeCountdownMs": 5000
- *       }]
- *     ]
- *
- * The options object is delivered as the second argument to this factory
- * (PluginOptions) and parsed via parseConfig(). Invalid shapes fall back
- * to defaults silently rather than crashing opencode.
- *
- * The previously-documented top-level `delegatedAccess` key is no longer
- * supported because opencode rejects unknown top-level keys at startup.
+ * V2 emits `{ sessionID, requestID, reply }` (verified against
+ * @opencode/client 2.0.3). V1 emitted `{ sessionID, permissionID, response }`
+ * with its own SDK/runtime drift. We accept both key sets — SDK-canonical
+ * V2 names win when both are present — and return `null` for anything that
+ * can't be coerced (the caller logs and skips).
  */
-const DelegatedAccess: Plugin = async (
-  { client, worktree, $ },
-  options,
-) => {
-  const log: Logger = createLogger(client)
-  log.info("plugin loaded")
+function normalizeRepliedProperties(
+  raw: unknown,
+): { sessionID: string; permissionID: string; response: string } | null {
+  if (!raw || typeof raw !== "object") return null
 
-  // Live repo-context cache: branch + open PR (via gh) — refreshed on a
-  // short TTL so the classifier always has an up-to-date view of where
-  // the agent thinks it is. Keyed by cwd (in practice always `worktree`).
-  const repoContextCache = new RepoContextCache({
-    $: $ as unknown as BunShellLike,
-  })
-
-  // Session-pinned repo context: captured exactly once (lazily on the
-  // first permission event) and frozen for the lifetime of the plugin
-  // process. Compared against the live `repoContextCache` so the
-  // classifier can detect when the agent has moved off the human's
-  // pre-committed branch/PR.
-  // Share the live cache's fetcher so the first permission event only
-  // pays for ONE git+gh round-trip — the session pin reads through the
-  // cache's first-call result and freezes it forever, while the cache
-  // continues refreshing it on its normal TTL.
-  const sessionRepoContext = new SessionRepoContext({
-    worktree,
-    fetcher: (cwd) => repoContextCache.get(cwd),
-  })
-
-  // Track whether we've already logged a "repo context unavailable" line
-  // so we don't spam the log on every permission event when gh is missing.
-  let loggedRepoContextUnavailable = false
-
-  async function getRepoContext(): Promise<DualRepoContext> {
-    const [pinned, current] = await Promise.all([
-      sessionRepoContext.getPinned(),
-      repoContextCache.get(worktree),
-    ])
-    if (
-      pinned === null &&
-      current === null &&
-      !loggedRepoContextUnavailable
-    ) {
-      log.info("repo context unavailable", { worktree })
-      loggedRepoContextUnavailable = true
-    }
-    return { pinned, current }
+  const r = raw as {
+    sessionID?: unknown
+    requestID?: unknown
+    reply?: unknown
+    permissionID?: unknown
+    response?: unknown
   }
 
-  // Config is resolved at factory time from the per-plugin tuple options.
-  // parseConfig handles undefined / empty / partial / invalid input by
-  // falling back to defaults. The `config` hook below is no longer used
-  // for plugin-specific config — only for the session's default model.
-  let config: DelegatedAccessConfig
-  try {
-    config = parseConfig(options)
-    log.info("config resolved", {
-      source: options !== undefined ? "tuple" : "defaults",
-      enabled: config.enabled,
-      contextMessageCount: config.contextMessageCount,
-      safeCountdownMs: config.safeCountdownMs,
-      classifierTimeoutMs: config.classifierTimeoutMs,
-      classifierRetries: config.classifierRetries,
-      classifierModel: config.classifierModel,
-      externalDirectoryEnabled: config.externalDirectoryEnabled,
-      directoryVerdictCacheTtlMs: config.directoryVerdictCacheTtlMs,
-      approvalHistoryEnabled: config.approvalHistoryEnabled,
-      approvalHistoryMax: config.approvalHistoryMax,
-      notifyOnClassifierFailure: config.notifyOnClassifierFailure,
-      classifierFailureNotifyCooldownMs: config.classifierFailureNotifyCooldownMs,
-    })
-  } catch (e) {
-    config = parseConfig(undefined)
-    log.warn("invalid plugin options; using defaults", {
-      error: e instanceof Error ? e.message : String(e),
-    })
-  }
+  if (typeof r.sessionID !== "string") return null
 
-  // The session's default model, resolved from opencode's Config. Updated
-  // on every `config` call so it stays in sync when the user changes models.
-  let sessionModel: ModelRef | undefined
+  const permissionID =
+    typeof r.requestID === "string"
+      ? r.requestID
+      : typeof r.permissionID === "string"
+        ? r.permissionID
+        : null
+  if (permissionID === null) return null
 
-  // Track IDs of ephemeral classifier sessions we create. All permission
-  // hooks skip events whose `sessionID` is in this set, so the classifier
-  // can't trigger itself (defense-in-depth — the classifier runs with
-  // `tools: { "*": false }` and shouldn't request permissions).
-  const ephemeralSessionIDs = new Set<string>()
+  const response =
+    typeof r.reply === "string"
+      ? r.reply
+      : typeof r.response === "string"
+        ? r.response
+        : null
+  if (response === null) return null
 
-  // Maps each ephemeral classifier session ID to the system prompt it should
-  // use. Read by the `experimental.chat.system.transform` hook below to strip
-  // opencode's global agent preamble/instructions from the classifier prompt
-  // (otherwise the classifier inherits e.g. the superpowers "you MUST invoke
-  // the skill" directive and replies conversationally instead of emitting a
-  // VERDICT — observed as repeated parse failures in production).
-  const ephemeralSystemRegistry = new EphemeralSystemRegistry()
-
-  // Shared TTL cache for recent SAFE external_directory verdicts. Held at
-  // plugin lifetime (not per-session) so burst deduplication works across
-  // rapid-fire permission events on the same session.
-  const directoryVerdictCache = new DirectoryVerdictCache()
-
-  // Per-plugin-lifetime store of recent human approval/rejection decisions
-  // scoped by root session ID. Surfaced to the classifier as prior-decision
-  // evidence; written by the `permission.replied` event handler when the
-  // human actually resolves a permission.
-  const approvalHistory = new ApprovalHistoryStore({
-    maxPerSession: config.approvalHistoryMax,
-  })
-
-  // Short-lived map of `permissionID → { rootSessionID, subject, ... }` that
-  // bridges the gap between rich subject info seen at permission-fire time
-  // and the bare permissionID carried by `permission.replied` events.
-  const pendingSubjects = new PendingSubjectsMap()
-
-  // Shared batcher for SAFE-path notifications. A single instance means all
-  // concurrent permission events funnel through the same 200ms batch window,
-  // so bursts (e.g. agent accessing 3 sub-directories at once) produce one
-  // macOS notification instead of N notifications that cancel each other.
-  //
-  // The batcher is constructed lazily-ish here with the initial config
-  // defaults. If the user changes safeCountdownMs or notificationSound mid-
-  // session via the config hook, the batcher won't pick that up automatically.
-  // In practice both fields are set at startup and never change, so this is
-  // fine. If dynamic reconfig ever becomes necessary, the batcher can be
-  // recreated in the config hook.
-  const safePathBatcher = new SafePathBatcher({
-    batchWindowMs: 200,
-    sendNotification,
-    countdownMs: config.safeCountdownMs,
-    sound: config.notificationSound,
-    log,
-  })
-
-  // Shared, plugin-lifetime rate limiter for classifier-failure
-  // notifications. Held here (not per-session) so a burst of failures across
-  // rapid permission events collapses into a single notification.
-  const failureNotifyRateLimiter = new FailureNotifyRateLimiter({
-    cooldownMs: config.classifierFailureNotifyCooldownMs,
-  })
-
-  // Permissions we've already handled, shared across all three hooks so
-  // each permissionID is classified once no matter which hook(s) fire.
-  const handledPermissionIDs = new Set<string>()
-
-  // Upper bound on the dedupe set so it can't grow unbounded in a long
-  // session. When we exceed this, prune half the entries (oldest first).
-  const MAX_HANDLED = 1024
-
-  function rememberHandled(permissionID: string) {
-    handledPermissionIDs.add(permissionID)
-    if (handledPermissionIDs.size > MAX_HANDLED) {
-      const toRemove = Math.floor(MAX_HANDLED / 2)
-      let i = 0
-      for (const id of handledPermissionIDs) {
-        if (i >= toRemove) break
-        handledPermissionIDs.delete(id)
-        i++
-      }
-    }
-  }
-
-  function buildCtx(): HandlerContext {
-    return {
-      client,
-      config,
-      sessionModel,
-      ephemeralSessionIDs,
-      directoryVerdictCache,
-      approvalHistory,
-      pendingSubjects,
-      safePathBatcher,
-      failureNotifyRateLimiter,
-      ephemeralSystemRegistry,
-      log,
-      getRepoContext,
-    }
-  }
-
-  /**
-   * Common dispatch: validate the permission, dedupe, log, call the
-   * handler. All three hook paths share this flow.
-   */
-  async function dispatch(
-    hookName: string,
-    permission: Permission | undefined | null,
-    output?: HandlerOutput,
-  ): Promise<void> {
-    if (!permission || typeof permission.id !== "string") {
-      // Nothing to process — some hook-input shapes may not carry a full
-      // Permission. Silently return; other hooks will cover it.
-      return
-    }
-
-    // Loop-guard: skip events from our own ephemeral classifier sessions.
-    if (ephemeralSessionIDs.has(permission.sessionID)) {
-      log.debug("skip: ephemeral classifier session", {
-        hook: hookName,
-        permissionID: permission.id,
-      })
-      return
-    }
-
-    // Dedupe: only handle each permission once across all hooks.
-    if (handledPermissionIDs.has(permission.id)) {
-      log.debug("skip: already handled", {
-        hook: hookName,
-        permissionID: permission.id,
-      })
-      return
-    }
-    rememberHandled(permission.id)
-
-    log.info("hook fired", {
-      hook: hookName,
-      permissionID: permission.id,
-      permissionType: permission.type,
-      pattern: permission.pattern as unknown,
-      hasOutput: output !== undefined,
-    })
-
-    try {
-      await handlePermissionEvent(permission, buildCtx(), {
-        hookName,
-        ...(output !== undefined ? { output } : {}),
-      })
-    } catch (e) {
-      log.error("handler threw", {
-        hook: hookName,
-        error: e instanceof Error ? e.message : String(e),
-      })
-    }
-  }
-
-  return {
-    // Isolate the ephemeral classifier session's system prompt from
-    // opencode's global agent preamble + instructions. `session.prompt`'s
-    // `system` field is ADDED to (not a replacement for) the assembled system
-    // context, so without this the classifier inherits AGENTS.md / skill
-    // preambles (e.g. "you MUST invoke the using-superpowers skill before ANY
-    // response") and replies conversationally instead of emitting a VERDICT —
-    // observed in production as repeated `classifier: response did not parse`
-    // failures. For OUR ephemeral classifier sessions only, replace the whole
-    // system array with just the registered classifier prompt.
-    //
-    // Registered via a direct string key (and cast) since the Hooks type
-    // marks this hook experimental/optional.
-    ...({
-      "experimental.chat.system.transform": async (
-        input: { sessionID?: string; model: unknown },
-        output: { system: string[] },
-      ) => {
-        applyEphemeralSystemTransform(input, output, ephemeralSystemRegistry)
-      },
-    } as Record<string, (input: unknown, output: unknown) => Promise<void>>),
-
-    config: async (input) => {
-      // The plugin's own config (enabled, safeCountdownMs, etc.) is no
-      // longer read from this hook — it's resolved at factory time from
-      // the tuple-form PluginOptions. This hook now exists only to
-      // extract the session's default model for the classifier's
-      // auto-detection, falling back to `small_model` if the user has
-      // one set.
-      sessionModel =
-        parseModelString(input.model) ?? parseModelString(input.small_model)
-
-      log.info("session model latched", {
-        sessionModel: sessionModel
-          ? `${sessionModel.providerID}/${sessionModel.modelID}`
-          : null,
-      })
-    },
-
-    // Path 1: typed permission.ask hook. If opencode dispatches this, we
-    // can set output.status = "allow" to pre-empt the TUI prompt.
-    "permission.ask": async (input, output) => {
-      // `input` is the Permission directly (per SDK type declaration).
-      await dispatch("permission.ask", input, output)
-    },
-
-    // Path 2: permission.updated hook. notification.js uses this path
-    // successfully on 1.4.x. Input shape is not formally typed in the SDK;
-    // probe defensively below.
-    //
-    // This hook is registered via a direct string key since @opencode-ai/
-    // plugin's Hooks type doesn't declare it.
-    ...({
-      "permission.updated": async (input: unknown) => {
-        const permission = extractPermission(input)
-        await dispatch("permission.updated", permission)
-      },
-    } as Record<string, (input: unknown) => Promise<void>>),
-
-    // Path 3: generic event hook. Filter to permission.asked /
-    // permission.updated / permission.replied event types.
-    event: async ({ event }) => {
-      const type: string = event.type
-
-      if (type === "permission.replied") {
-        const props = (event as { properties?: unknown }).properties
-        const normalized = normalizeRepliedProperties(props)
-        if (normalized === null) {
-          log.warn("permission.replied: malformed event properties", {
-            properties: props,
-          })
-          return
-        }
-        handlePermissionReplied(normalized, {
-          pendingSubjects,
-          approvalHistory,
-          config,
-          log,
-        })
-        return
-      }
-
-      if (type !== "permission.asked" && type !== "permission.updated") return
-
-      const permission = extractPermission(event)
-      await dispatch(`event:${type}`, permission)
-    },
-  }
+  return { sessionID: r.sessionID, permissionID, response }
 }
 
 /**
- * Defensively extract a `Permission` from whatever shape opencode hands
- * our hooks. Different hooks (and possibly different opencode versions)
- * send different shapes; we probe the common locations:
- *
- *   - `input` itself is a Permission (typed hook path)
- *   - `input.permission` (possible nested shape)
- *   - `input.properties` (event-hook shape: `{ type, properties: Permission }`)
- *   - `input.event.properties` (nested event wrapping)
- *
- * Returns `null` if nothing resembling a Permission is found.
- */
-function extractPermission(input: unknown): Permission | null {
-  if (!input || typeof input !== "object") return null
-  const candidates: unknown[] = [
-    input,
-    (input as { permission?: unknown }).permission,
-    (input as { properties?: unknown }).properties,
-    (input as { event?: { properties?: unknown } }).event?.properties,
-  ]
-  for (const c of candidates) {
-    if (
-      c &&
-      typeof c === "object" &&
-      typeof (c as { id?: unknown }).id === "string" &&
-      typeof (c as { sessionID?: unknown }).sessionID === "string"
-    ) {
-      return c as Permission
-    }
-  }
-  return null
-}
-
-/**
- * Parse opencode's `model: "provider/model-id"` shape into a ModelRef, or
+ * Parse a `model: "provider/model-id"` tuple option into a ModelRef, or
  * undefined if the input is missing/malformed. Model IDs may contain
  * slashes (e.g. openrouter's "anthropic/claude-haiku"), so we split on the
  * first slash only.
  */
-function parseModelString(input: string | undefined): ModelRef | undefined {
+function parseModelString(
+  input: unknown,
+): { providerID: string; modelID: string } | undefined {
   if (typeof input !== "string") return undefined
   const trimmed = input.trim()
   if (!trimmed) return undefined
