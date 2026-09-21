@@ -418,6 +418,60 @@ describe("classifyCommand", () => {
       expect(generate.text).toHaveBeenCalledTimes(2)
     })
 
+    it("retries when the aborted request REJECTS (real client behavior)", async () => {
+      // The real client aborts the fetch, which rejects (ClientError
+      // "Transport"). That rejection can win the race before the timeout
+      // resolves, so it must still be treated as a retryable timeout.
+      const generate = makeGenerateDomain()
+      generate.text
+        .mockImplementationOnce(
+          (_input, opts) =>
+            new Promise<{ text: string }>((_resolve, reject) => {
+              opts?.signal?.addEventListener("abort", () =>
+                reject(new Error("The operation was aborted.")),
+              )
+            }),
+        )
+        .mockResolvedValueOnce({
+          text: "VERDICT: SAFE\nREASON: retry-ok",
+        })
+
+      const result = await classifyCommand({
+        ...baseArgs,
+        generate,
+        timeoutMs: 20,
+        retries: 1,
+      })
+
+      expect(result).toEqual<Verdict>({ verdict: "SAFE", reason: "retry-ok" })
+      expect(generate.text).toHaveBeenCalledTimes(2)
+    })
+
+    it("reports a rejected abort as a timeout, not a hard error, once retries are exhausted", async () => {
+      const generate = makeGenerateDomain()
+      generate.text.mockImplementation(
+        (_input, opts) =>
+          new Promise<{ text: string }>((_resolve, reject) => {
+            opts?.signal?.addEventListener("abort", () =>
+              reject(new Error("The operation was aborted.")),
+            )
+          }),
+      )
+      const onFailure = vi.fn()
+
+      const result = await classifyCommand({
+        ...baseArgs,
+        generate,
+        timeoutMs: 20,
+        retries: 1,
+        onFailure,
+      })
+
+      expect(result).toBeNull()
+      expect(generate.text).toHaveBeenCalledTimes(2)
+      expect(onFailure).toHaveBeenCalledWith("timeout")
+    })
+
     it("retries a malformed (unparseable) response with a format-correction prompt", async () => {
       // First attempt: model narrates its role instead of answering.
       // Retry: model complies and returns a parseable verdict.

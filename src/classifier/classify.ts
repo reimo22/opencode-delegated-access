@@ -275,6 +275,20 @@ async function classifyOnce(
     }
     return { kind: "verdict", verdict }
   } catch (e) {
+    // A timeout aborts the request, and the aborted fetch REJECTS (the client
+    // rethrows the AbortError as `ClientError("Transport")`). That rejection
+    // can win the Promise.race before the timeout promise resolves, landing
+    // here. Report it as a timeout so the retry loop and `onFailure` classify
+    // it correctly instead of as a hard error.
+    if (timedOut) {
+      log?.warn("classifier: timeout — no verdict (fail-closed)", {
+        timeoutMs,
+        attempt,
+        maxAttempts,
+        willRetry: attempt < maxAttempts,
+      })
+      return { kind: "timeout" }
+    }
     log?.error("classifier: prompt threw (fail-closed)", {
       error: e instanceof Error ? e.message : String(e),
     })

@@ -68,7 +68,9 @@ beforeEach(() => {
  * there is no callable factory in V2.
  */
 async function setupPlugin(options?: Record<string, unknown>) {
-  const { ctx, session, permission, event } = makePluginContext({ options })
+  const { ctx, session, generate, permission, event } = makePluginContext({
+    options,
+  })
 
   await DelegatedAccess.setup(ctx as never)
 
@@ -76,7 +78,7 @@ async function setupPlugin(options?: Record<string, unknown>) {
     (call) => call[0] === "evaluate",
   )?.[1] as ((ev: unknown) => Promise<void>) | undefined
 
-  return { evaluate, session, permission, event, ctx }
+  return { evaluate, session, generate, permission, event, ctx }
 }
 
 /** One pending subject, as the evaluate path would have seeded it. */
@@ -183,7 +185,7 @@ describe("DelegatedAccess setup — V2 hook registration", () => {
   })
 
   it("dispatches each evaluation to the handler with a handler context", async () => {
-    const { evaluate } = await setupPlugin()
+    const { evaluate, generate } = await setupPlugin()
     const ev = makeEvaluation()
 
     await evaluate!(ev)
@@ -193,6 +195,10 @@ describe("DelegatedAccess setup — V2 hook registration", () => {
     const ctx = mockedHandle.mock.calls[0]?.[1]
     expect(typeof ctx!.log.info).toBe("function")
     expect(ctx!.pendingSubjects).toBeDefined()
+    // `generate` is behind an `as unknown as` cast in index.ts, so the
+    // compiler can't catch its removal. Without it the classifier fails
+    // closed on every permission — assert the wiring explicitly.
+    expect(ctx!.opencode.generate).toBe(generate)
   })
 
   it("swallows handler exceptions and leaves effect untouched (fail-closed)", async () => {

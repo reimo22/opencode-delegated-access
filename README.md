@@ -3,11 +3,12 @@
 > to the OpenCode **V2** plugin API (`@opencode/plugin`, `Plugin.define` with `ctx.*`
 > domains). Upstream is V1-only and dormant since 2026-06 (latest release v0.4.0).
 >
-> - **`main`** — identical to upstream v0.4.0. V1, OpenCode 1.x. Unchanged.
-> - **`v2`** — the V2 port. Verified against OpenCode 2.0.3: a SAFE command
->   auto-approves with no prompt; a RISKY command raises both the TUI prompt and a
->   desktop notification. 433 unit tests pass and `tsc --noEmit` is clean
->   (`npm test`, `npm run check`). Requires `@opencode/plugin` ^2.0.3 and Node ≥22.
+> - **`main`** (default) — the V2 port. Verified against OpenCode 2.0.3: a SAFE
+>   command auto-approves with no prompt; a RISKY command raises both the TUI prompt
+>   and a desktop notification. `npm test` and `npm run check` are green. Requires
+>   `@opencode/plugin` ^2.0.3 and Node ≥22.
+> - **`v1`** — upstream v0.4.0, V1, unchanged. (This was the old `main`; renamed on
+>   2026-09-22 when the V2 port took over `main`.)
 >
 > ### Fork differences
 >
@@ -189,7 +190,7 @@ Use the **per-plugin tuple form** — `[pluginSpec, optionsObject]` — to pass 
 | `safeCountdownMs` | `5000` | Cancellable countdown before auto-dismissing SAFE prompts. `0` = silent instant approve. |
 | `classifierModel` | _auto_ | Override the judge model, e.g. `anthropic/claude-haiku-4-5`. When unset, uses a small fast default for your provider (Haiku, `gpt-5.4-mini`, `gemini-flash-lite`). |
 | `classifierTimeoutMs` | `15000` | How long before we give up on a single classifier attempt. |
-| `classifierRetries` | `1` | Extra attempts if a classifier call **times out** (transient API stall). Each retry uses a fresh session and the full `classifierTimeoutMs`. `0` disables retry. Only timeouts retry; other failures never do. |
+| `classifierRetries` | `1` | Extra attempts if a classifier call **times out** (transient API stall). Each retry uses the full `classifierTimeoutMs`. `0` disables retry. Only timeouts retry; other failures never do. |
 | `notificationSound` | `true` | OS notification sound on/off. |
 | `externalDirectoryEnabled` | `true` | Also classify `external_directory` permissions (directory access outside the current project). Set to `false` to restrict the plugin to bash commands only. |
 | `directoryVerdictCacheTtlMs` | `60000` | How long (ms) a SAFE directory verdict is cached. Covers rapid burst requests (agent walking a tree) without re-classifying each sub-path individually. `0` disables the cache. |
