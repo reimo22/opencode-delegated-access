@@ -53,7 +53,6 @@ import {
   type HandlerContext,
   type PermissionEvaluation,
 } from "./handler.ts"
-import { EphemeralSystemRegistry } from "../classifier/ephemeral-system.ts"
 import { DirectoryVerdictCache } from "./directory-cache.ts"
 import { ApprovalHistoryStore } from "./approval-history.ts"
 import { PendingSubjectsMap } from "./pending-subjects.ts"
@@ -462,35 +461,15 @@ describe("handlePermissionEvent", () => {
     expect(args?.retries).toBe(1)
   })
 
-  it("registers the ephemeral session's system prompt for the isolation hook", async () => {
+  it("forwards the generate domain to the classifier", async () => {
     mockedClassify.mockResolvedValueOnce({ verdict: "SAFE", reason: "r" })
     mockedSafe.mockResolvedValueOnce("allow")
 
-    const registry = new EphemeralSystemRegistry()
-    const ctx = buildCtx({ ephemeralSystemRegistry: registry })
+    const ctx = buildCtx()
     await handlePermissionEvent(makeEvaluation(), ctx)
 
-    // The handler must wire onEphemeralSessionCreated so that (id, prompt)
-    // lands in the registry. Simulate the classifier invoking the callback.
-    const onCreated = mockedClassify.mock.calls[0]?.[0]?.onEphemeralSessionCreated
-    expect(typeof onCreated).toBe("function")
-    onCreated?.("sess_eph_test", "CLASSIFIER SYSTEM PROMPT")
-    expect(registry.get("sess_eph_test")).toBe("CLASSIFIER SYSTEM PROMPT")
-  })
-
-  it("clears the ephemeral system prompt from the registry on session delete", async () => {
-    mockedClassify.mockResolvedValueOnce({ verdict: "SAFE", reason: "r" })
-    mockedSafe.mockResolvedValueOnce("allow")
-
-    const registry = new EphemeralSystemRegistry()
-    const ctx = buildCtx({ ephemeralSystemRegistry: registry })
-    await handlePermissionEvent(makeEvaluation(), ctx)
-
-    const call = mockedClassify.mock.calls[0]?.[0]
-    call?.onEphemeralSessionCreated?.("sess_eph_test", "P")
-    expect(registry.has("sess_eph_test")).toBe(true)
-    call?.onEphemeralSessionDeleted?.("sess_eph_test")
-    expect(registry.has("sess_eph_test")).toBe(false)
+    const args = mockedClassify.mock.calls[0]?.[0]
+    expect(args?.generate).toBe(ctx.opencode.generate)
   })
 
   it("does nothing when no classifier model can be resolved", async () => {
@@ -502,24 +481,6 @@ describe("handlePermissionEvent", () => {
     await handlePermissionEvent(ev, ctx)
     expect(mockedClassify).not.toHaveBeenCalled()
     expect(ev.effect).toBe("ask")
-  })
-
-  it("passes the loop-guard callbacks to classifyCommand", async () => {
-    mockedClassify.mockResolvedValueOnce({ verdict: "SAFE", reason: "r" })
-    mockedSafe.mockResolvedValueOnce("allow")
-
-    const ctx = buildCtx()
-    await handlePermissionEvent(makeEvaluation(), ctx)
-
-    const args = mockedClassify.mock.calls[0]?.[0]
-    expect(typeof args?.onEphemeralSessionCreated).toBe("function")
-    expect(typeof args?.onEphemeralSessionDeleted).toBe("function")
-
-    // Exercise the callbacks to confirm they update the tracking set.
-    args?.onEphemeralSessionCreated?.("sess_eph_abc", "system prompt")
-    expect(ctx.ephemeralSessionIDs.has("sess_eph_abc")).toBe(true)
-    args?.onEphemeralSessionDeleted?.("sess_eph_abc")
-    expect(ctx.ephemeralSessionIDs.has("sess_eph_abc")).toBe(false)
   })
 
   it("injected reply is fail-closed when permission.list throws (TUI prompt remains)", async () => {
@@ -747,10 +708,9 @@ describe("handlePermissionEvent", () => {
   })
 
   it("keeps the permission's ORIGINAL sessionID as the classifier's parentSessionID", async () => {
-    // Even when the resolver discovers a different root, the ephemeral
-    // classifier session should be parented at the permission's session
-    // (the subagent's), so the ephemeralSessionIDs loop-guard keeps
-    // working.
+    // Even when the resolver discovers a different root, the classifier is
+    // told which session the permission actually fired in (the subagent's),
+    // so attribution stays exact. (User messages still come from the root.)
     mockedClassify.mockResolvedValueOnce({ verdict: "SAFE", reason: "r" })
     mockedSafe.mockResolvedValueOnce("allow")
     mockedResolveRoot.mockImplementationOnce(async () => "sess_root")

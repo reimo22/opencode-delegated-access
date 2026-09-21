@@ -26,10 +26,12 @@
 >   Options attach to that same entry as `"options": { … }`; §3 below lists the option
 >   names. Upstream's `"…/src/index.ts"` and `…@git+https://…` plugin forms do not load
 >   under V2.
-> - **Hook model.** V2 dispatches one hook per request kind (`context`, `compaction`,
->   `generate`, `title`); the classifier's isolated system prompt is installed on the hooks
->   it needs instead of by rewriting a single `system` array
->   (`src/classifier/ephemeral-system.ts`).
+> - **Classifier transport.** The classifier runs through OpenCode's one-shot `generate.text`
+>   API (`ctx.generate.text`), which creates **no session**, adds nothing to session history,
+>   never dispatches tools, and never runs the agent loop — so it can't inherit the global
+>   agent preamble. The classifier system prompt is prepended inline to the prompt. (Earlier
+>   revisions created an ephemeral session per classification and isolated it via
+>   `session.hook("context"/"generate")`; that machinery is gone.)
 > - **Notifications work off macOS.** Upstream constructed node-notifier's macOS-only
 >   `NotificationCenter` backend unconditionally; on Linux and Windows every notification
 >   failed and RISKY escalation degraded to TUI-only without saying so. This branch uses
@@ -115,7 +117,7 @@ Every time OpenCode would prompt for a bash command **or an external directory a
                 block
 ```
 
-The classifier call happens in an **ephemeral child session** of your current session, using OpenCode's own provider + auth — no extra API keys, no extra packages to configure. It's hidden from session lists and deleted when done.
+The classifier call is a one-shot `generate.text` request using OpenCode's own provider + auth — no extra API keys, no extra packages to configure. It creates no session, so it never appears in session history.
 
 ### About that TUI flash
 
@@ -226,9 +228,9 @@ The desktop notifications with Approve / Reject buttons work via `terminal-notif
 - **The classifier never sees the agent's messages.** Only yours. A rogue assistant can't smuggle "this command is safe, trust me" into the judge's context. Same for directory access — the classifier answers "did the human's recent messages justify this path?" not "does the agent think it's safe?"
 - **Subagents don't weaken that.** When a permission fires inside a subagent session, the plugin walks up the session tree to the root and pulls _your_ messages from there — never the dispatching agent's prompt to the subagent. If the tree can't be verified (SDK error, unexpected cycle, too deep) the plugin fails closed and leaves the TUI prompt for you. Even on the root session, user-role messages are filtered to the root's primary agent so synthetic "user" turns addressed elsewhere never leak in.
 - **Every error leaves the TUI prompt alone.** Classifier timeout, API error, malformed verdict, missing subject, session-tree lookup failure, unexpected exception — none of them call the respond API, so the TUI prompt stays and you decide manually. The plugin only ever _dismisses_ a prompt after an affirmative SAFE decision, never silently passes through on errors.
-- **The classifier can't call tools.** The ephemeral session runs with `tools: { "*": false }`, so even a compromised classifier model can only return text.
+- **The classifier can't call tools.** `generate.text` is a plain text completion — it never registers or dispatches tools, so even a compromised classifier model can only return text.
 - **Risky commands and risky directory requests get two channels, not one.** The TUI prompt stays up AND the notification fires with Approve/Reject. Whichever you answer first wins — no bug in the notification path can ever accidentally auto-approve a RISKY request.
-- **The classifier can't trigger itself.** We track ephemeral classifier sessions and ignore permission events from them.
+- **The classifier can't trigger itself.** It runs outside any session and issues no tool calls, so it can't produce permission events at all.
 - **The directory cache only speeds things up; it can't change a RISKY verdict.** Only SAFE verdicts are cached. A RISKY verdict for any path always triggers the escalation notification — the cache only deduplicates rapid burst requests for a path that was already classified SAFE.
 - **Repo context is best-effort and gracefully optional.** Branch is read with `git`; the open-PR lookup uses `gh`. If `gh` isn't installed, isn't authenticated, or the working directory isn't a git repo, the classifier just runs without that context — never blocks. The PR title is rendered inside `<repo_context>` delimiters and treated as data (not instructions) by the classifier.
 - **The session pin can't be moved by the agent.** PR-scoped elevated trust depends on a snapshot captured exactly once at plugin startup. There is no API to refresh, reset, or invalidate it for the lifetime of the OpenCode process — the agent can't `git checkout` its way into a different trust scope.

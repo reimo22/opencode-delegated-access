@@ -36,9 +36,9 @@ export const ConfigSchema = z.object({
 
   /**
    * Number of extra classifier attempts to make if the prompt TIMES OUT.
-   * `1` (default) retries a transient stall once with a fresh ephemeral
-   * session and the full `classifierTimeoutMs`. `0` disables retry. Only
-   * timeouts retry — other failures are never retried. Capped at 10.
+   * `1` (default) retries a transient stall once with the full
+   * `classifierTimeoutMs`. `0` disables retry. Only timeouts retry — other
+   * failures are never retried. Capped at 10.
    */
   classifierRetries: z.number().int().min(0).max(10).default(1),
 

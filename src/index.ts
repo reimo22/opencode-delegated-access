@@ -12,10 +12,6 @@ import { SafePathBatcher } from "./permission/safe-path-batcher.ts"
 import { ApprovalHistoryStore } from "./permission/approval-history.ts"
 import { PendingSubjectsMap } from "./permission/pending-subjects.ts"
 import { FailureNotifyRateLimiter } from "./permission/failure-notify.ts"
-import {
-  EphemeralSystemRegistry,
-  registerEphemeralIsolationHooks,
-} from "./classifier/ephemeral-system.ts"
 import { sendNotification } from "./notify/notify.ts"
 import type { ModelRef } from "./classifier/model.ts"
 import { createLogger, type Logger } from "./log.ts"
@@ -36,14 +32,12 @@ import { SessionRepoContext } from "./session-repo-context.ts"
  *      `ev.effect = "allow"` to auto-approve with no flash. Everything is
  *      fail-closed: any error or uncertainty leaves `effect` untouched and
  *      the human decides in the TUI.
- *   2. `session.hook("context")` — for OUR ephemeral classifier sessions
- *      only, replace the assembled `system` array with just the registered
- *      classifier prompt and clear `tools` entirely. (V1 used the
- *      `experimental.chat.system.transform` hook + a per-prompt tools map;
- *      the context hook replaces both and is stronger — a user allowlist
- *      can't re-enable tools for the classifier.)
- *   3. `event.subscribe()` — consumed in the background for
+ *   2. `event.subscribe()` — consumed in the background for
  *      `permission.replied`, feeding the approval-history store.
+ *
+ * Classification itself runs through `ctx.generate.text` (see
+ * src/classifier/classify.ts): a one-shot model call that creates no session
+ * and adds nothing to session history.
  *
  * All diagnostic output goes through the console-backed logger; opencode
  * captures plugin stdout/stderr into its log file. Grep with:
@@ -162,20 +156,6 @@ const DelegatedAccess = Plugin.define({
         (ctx.options as { model?: unknown } | undefined)?.model,
       ) ?? undefined
 
-    // Track IDs of ephemeral classifier sessions we create. All permission
-    // evaluations skip events whose `sessionID` is in this set, so the
-    // classifier can't trigger itself (defense-in-depth — the context hook
-    // also clears its tools entirely).
-    const ephemeralSessionIDs = new Set<string>()
-
-    // Maps each ephemeral classifier session ID to the system prompt it should
-    // use. Read by the `session.hook("context")` handler below to REPLACE
-    // opencode's global agent preamble/instructions for the classifier prompt
-    // (otherwise the classifier inherits e.g. the superpowers "you MUST invoke
-    // the skill" directive and replies conversationally instead of emitting a
-    // VERDICT — observed as repeated parse failures in production).
-    const ephemeralSystemRegistry = new EphemeralSystemRegistry()
-
     // Shared TTL cache for recent SAFE external_directory verdicts. Held at
     // plugin lifetime (not per-session) so burst deduplication works across
     // rapid-fire permission events on the same session.
@@ -220,6 +200,7 @@ const DelegatedAccess = Plugin.define({
     const opencode = {
       session: ctx.session,
       permission: ctx.permission,
+      generate: ctx.generate,
     } as unknown as OpencodeAccess
 
     function buildCtx(): HandlerContext {
@@ -227,13 +208,11 @@ const DelegatedAccess = Plugin.define({
         opencode,
         config,
         sessionModel,
-        ephemeralSessionIDs,
         directoryVerdictCache,
         approvalHistory,
         pendingSubjects,
         safePathBatcher,
         failureNotifyRateLimiter,
-        ephemeralSystemRegistry,
         log,
         getRepoContext,
       }
@@ -241,15 +220,6 @@ const DelegatedAccess = Plugin.define({
 
     // --- Hook 1: permission evaluation (pre-prompt interception) ------------
     await ctx.permission.hook("evaluate", async (ev) => {
-      // Loop-guard: skip evaluations from our own ephemeral classifier
-      // sessions.
-      if (ephemeralSessionIDs.has(ev.sessionID)) {
-        log.debug("skip: ephemeral classifier session", {
-          permissionAction: ev.action,
-        })
-        return
-      }
-
       log.info("permission evaluate fired", {
         permissionAction: ev.action,
         resources: ev.resources as unknown,
@@ -268,17 +238,7 @@ const DelegatedAccess = Plugin.define({
       }
     })
 
-    // --- Hook 2: session context isolation for ephemeral classifier sessions
-    // (system prompt replacement + total tool denial). Registered for ALL
-    // sessions but a no-op for every session not in the ephemeral registry.
-    await registerEphemeralIsolationHooks(
-      ctx.session,
-      ephemeralSessionIDs,
-      ephemeralSystemRegistry,
-      (sessionID) => log.debug("classifier context isolated", { sessionID }),
-    )
-
-    // --- Hook 3: permission.replied → approval history -----------------------
+    // --- Hook 2: permission.replied → approval history -----------------------
     const repliedEvents = await ctx.event.subscribe()
     void (async () => {
       for await (const event of repliedEvents) {

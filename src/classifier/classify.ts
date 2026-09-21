@@ -13,27 +13,21 @@ import type { ApprovalEntry } from "../permission/approval-history.ts"
 import type { Logger } from "../log.ts"
 
 /**
- * Structural slice of the V2 `ctx.session` domain the classifier needs.
+ * Structural slice of the V2 `ctx.generate` domain the classifier needs.
  * (Structural typing keeps us resilient to minor shape drift — the V2
  * package root doesn't export domain types directly.)
+ *
+ * `generate.text` is a one-shot model call: it creates no session, invokes no
+ * tools, and adds nothing to session history. That is why the classifier uses
+ * it — a session-per-classification used to flood the session list with
+ * `[delegated-access classifier]` entries.
  */
-export type ClassifierSession = {
-  create(input: {
-    title?: string
-    model?: { providerID: string; id: string }
-  }): Promise<{ id?: string } | undefined>
-  generate(input: {
-    sessionID: string
-    prompt: string
-  }): Promise<{ text?: string } | undefined>
-  interrupt(input: { sessionID: string }): Promise<unknown>
+export type ClassifierGenerator = {
+  text(
+    input: { prompt: string; model?: { providerID: string; id: string } },
+    requestOptions?: { signal?: AbortSignal },
+  ): Promise<{ text?: string } | undefined>
 }
-
-/**
- * Title for the ephemeral classifier session. Picked to be obvious if a user
- * ever sees one in a session list so they know it's plugin-generated.
- */
-const CLASSIFIER_SESSION_TITLE = "[delegated-access classifier]"
 
 /**
  * Run the safety classifier for a permission subject (a bash command, a
@@ -43,21 +37,16 @@ const CLASSIFIER_SESSION_TITLE = "[delegated-access classifier]"
  * function remains agnostic about what is being classified.
  *
  * Flow:
- *   1. Create an ephemeral session with the classifier model attached.
- *      NOTE (V2): the plugin-facing session domain exposes no `parentID` on
- *      create and no `remove` — the session is top-level (identifiable by
- *      its title) and is NOT deleted after use. Sessions are cheap and
- *      clearly labelled; the loop-guard still tracks their IDs.
- *   2. The system prompt and tool-deny are enforced by the caller's
- *      `session.hook("context")` handler (registered in src/index.ts), which
- *      rewrites `system` to just the registered classifier prompt and clears
- *      `tools` for sessions tracked in the ephemeral registry. This is
- *      stronger than V1's per-prompt `tools` map: it runs in-process at
- *      request-assembly time and can't be overridden by user permission
- *      allowlists.
- *   3. Call `session.generate` with the user prompt built from the subject +
- *      recent user messages, parse the text with {@link parseVerdict}.
- *   4. On timeout, interrupt the session and treat the attempt as failed
+ *   1. Build the classifier prompt: the caller-supplied system prompt is
+ *      prepended to the user prompt built from subject + recent user messages.
+ *      There is no session and no system-prompt channel, so the system
+ *      instructions travel inline.
+ *   2. Call `generate.text` with the classifier model attached. Because
+ *      `generate.text` never dispatches tools and never runs the agent loop,
+ *      the classifier cannot inherit opencode's global agent
+ *      preamble/instructions, and no session is created.
+ *   3. Parse the response text with {@link parseVerdict}.
+ *   4. On timeout, abort the in-flight request and treat the attempt as failed
  *      (fail-closed — a partial response is NEVER trusted).
  *
  * Fail-closed behaviour: returns `null` for any error, malformed response,
@@ -65,7 +54,7 @@ const CLASSIFIER_SESSION_TITLE = "[delegated-access classifier]"
  * failure → fall back to the normal opencode approval prompt".
  */
 export async function classifySubject(args: {
-  session: ClassifierSession
+  generate: ClassifierGenerator
   /** The string being classified (command, path pattern, etc.). */
   subject: string
   /** Recent human-authored messages to give the classifier context. */
@@ -104,35 +93,18 @@ export async function classifySubject(args: {
    */
   priorApprovals?: ApprovalEntry[]
   /**
-   * Called with the ephemeral classifier session's ID AND the system prompt
-   * that session will use, as soon as the session is created. Callers track
-   * the ID to filter out downstream permission events the classifier session
-   * might generate (loop-guard), and register the system prompt for the
-   * `session.hook("context")` isolation handler (so the global agent
-   * preamble/instructions are stripped from the classifier prompt and its
-   * tools are denied).
-   */
-  onEphemeralSessionCreated?: (id: string, systemPrompt: string) => void
-  /**
-   * Called with the ephemeral session's ID when the attempt finishes.
-   * Callers should clear the session ID from their tracking set here.
-   */
-  onEphemeralSessionDeleted?: (id: string) => void
-  /**
-   * Optional diagnostic logger. Every fail-closed branch (create error,
-   * missing session id, prompt error, timeout, empty response, unparseable
-   * verdict) emits an actionable log line so an upstream API break isn't
-   * silently swallowed by the fail-closed `catch`. When omitted, failures
-   * are silent (preserves the historical behaviour for callers that don't
-   * pass a logger).
+   * Optional diagnostic logger. Every fail-closed branch (prompt error,
+   * timeout, empty response, unparseable verdict) emits an actionable log
+   * line so an upstream API break isn't silently swallowed by the fail-closed
+   * `catch`. When omitted, failures are silent (preserves the historical
+   * behaviour for callers that don't pass a logger).
    */
   log?: Logger
   /**
    * Number of extra attempts to make if the classifier prompt TIMES OUT.
    * `0` (default) = single attempt, no retry. Only timeouts retry — other
-   * failures (unparseable verdict, session-create error, thrown prompt) are
-   * returned immediately, since retrying them just wastes time. Each retry
-   * uses a FRESH ephemeral session and the FULL `timeoutMs`.
+   * failures (unparseable verdict, thrown prompt) are returned immediately,
+   * since retrying them just wastes time. Each retry uses the FULL `timeoutMs`.
    */
   retries?: number
   /**
@@ -140,17 +112,17 @@ export async function classifySubject(args: {
    * ultimately fails (after any retries). Not called on success. Lets the
    * caller surface a notification distinguishing a transient timeout from a
    * harder error. `"timeout"` = the prompt(s) timed out; `"error"` =
-   * anything else (create error, thrown prompt, empty/unparseable response).
+   * anything else (thrown prompt, empty/unparseable response).
    */
   onFailure?: (failureClass: ClassifyFailureClass) => void
 }): Promise<Verdict | null> {
   const { retries = 0, onFailure } = args
 
   // Retry loop: a `timeout` OR a `malformed` (unparseable) outcome is retried
-  // (up to `retries` times). Hard errors (session-create failure, thrown
-  // prompt, empty response) are final immediately — retrying them just wastes
-  // time. The full `timeoutMs` is used on every attempt; the success case
-  // returns fast regardless of the timeout ceiling.
+  // (up to `retries` times). Hard errors (thrown prompt, empty response) are
+  // final immediately — retrying them just wastes time. The full `timeoutMs`
+  // is used on every attempt; the success case returns fast regardless of the
+  // timeout ceiling.
   //
   // A retry that FOLLOWS a malformed response asks the model again with an
   // explicit format-correction instruction appended — small models that
@@ -202,7 +174,7 @@ Classify the original subject again now.
 </format_correction>`
 
 /**
- * A single classifier attempt: create an ephemeral session, generate with a
+ * A single classifier attempt: build the prompt, call `generate.text` with a
  * timeout, parse the verdict. Returns a discriminated outcome so the caller's
  * retry loop can distinguish a retryable timeout from a final error. Never
  * throws.
@@ -219,7 +191,7 @@ async function classifyOnce(
   correctFormat = false,
 ): Promise<ClassifyOutcome> {
   const {
-    session,
+    generate,
     subject,
     userMessages,
     parentSessionID,
@@ -229,35 +201,14 @@ async function classifyOnce(
     buildUserPrompt,
     repoContext,
     priorApprovals,
-    onEphemeralSessionCreated,
-    onEphemeralSessionDeleted,
     log,
   } = args
   void parentSessionID
 
-  // Step 1: create ephemeral session with the classifier model attached.
-  let ephemeralID: string | undefined
-  try {
-    const created = await session.create({
-      title: CLASSIFIER_SESSION_TITLE,
-      model: { providerID: model.providerID, id: model.modelID },
-    })
-    ephemeralID = created?.id
-  } catch (e) {
-    log?.error("classifier: ephemeral session.create threw", {
-      error: e instanceof Error ? e.message : String(e),
-    })
-    return { kind: "error" }
-  }
-  if (!ephemeralID) {
-    log?.warn("classifier: session.create returned no session id", {})
-    return { kind: "error" }
-  }
-  onEphemeralSessionCreated?.(ephemeralID, systemPrompt)
-
   let timedOut = false
   try {
-    // Step 2: classifier prompt with timeout.
+    // Step 1: assemble the prompt. `generate.text` has no system-prompt
+    // channel, so the classifier system instructions are prepended inline.
     const baseUserPrompt = buildUserPrompt({
       subject,
       userMessages,
@@ -267,29 +218,27 @@ async function classifyOnce(
     const userPrompt = correctFormat
       ? baseUserPrompt + FORMAT_CORRECTION_INSTRUCTION
       : baseUserPrompt
+    const prompt = `${systemPrompt}\n\n${userPrompt}`
 
-    const generateCall = session.generate({
-      sessionID: ephemeralID,
-      prompt: userPrompt,
-    })
+    // Step 2: one-shot model call with a timeout. The signal aborts the
+    // in-flight HTTP request when the timeout fires.
+    const controller = new AbortController()
+    const generateCall = generate.text(
+      { prompt, model: { providerID: model.providerID, id: model.modelID } },
+      { signal: controller.signal },
+    )
 
-    const response = await withTimeout(generateCall, timeoutMs, async () => {
+    const response = await withTimeout(generateCall, timeoutMs, () => {
       timedOut = true
-      // Await the interrupt so the in-flight generation is actually stopped
-      // before we finish. Best-effort.
-      try {
-        await session.interrupt({ sessionID: ephemeralID! })
-      } catch {
-        // Interrupt is best-effort.
-      }
+      controller.abort()
     })
 
     // Fail-closed gate: if the timeout fired at ANY point during the race,
-    // discard whatever the prompt promise returned. Partial pre-interrupt
-    // responses have been observed to contain well-formed "VERDICT: SAFE"
-    // text that would otherwise auto-approve a command whose classification
-    // never actually completed — violating the plugin's fail-closed
-    // contract (see README "How it's safe").
+    // discard whatever the promise returned. Partial pre-abort responses have
+    // been observed to contain well-formed "VERDICT: SAFE" text that would
+    // otherwise auto-approve a command whose classification never actually
+    // completed — violating the plugin's fail-closed contract (see README
+    // "How it's safe").
     if (timedOut) {
       log?.warn("classifier: timeout — no verdict (fail-closed)", {
         timeoutMs,
@@ -330,14 +279,6 @@ async function classifyOnce(
       error: e instanceof Error ? e.message : String(e),
     })
     return { kind: "error" }
-  } finally {
-    // Step 4: the V2 plugin session domain exposes no session-remove, so the
-    // ephemeral session is left in place (clearly titled, interrupted if it
-    // timed out). Drop it from the caller's tracking set.
-    if (timedOut) {
-      await sleep(POST_ABORT_SETTLE_MS)
-    }
-    onEphemeralSessionDeleted?.(ephemeralID)
   }
 }
 
@@ -393,18 +334,10 @@ export function classifyDirectory(
   })
 }
 
-/** Grace period between interrupting a timed-out prompt and moving on. */
-const POST_ABORT_SETTLE_MS = 250
-
-function sleep(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms))
-}
-
 /**
- * Race a promise against a timeout. If the timeout fires first, awaits
- * `onTimeout` (so callers can cleanly abort in-flight work before the
- * caller's finally-block runs) and then resolves to `null`. Otherwise
- * passes through the promise's result.
+ * Race a promise against a timeout. If the timeout fires first, runs
+ * `onTimeout` (so callers can abort in-flight work) and then resolves to
+ * `null`. Otherwise passes through the promise's result.
  */
 async function withTimeout<T>(
   p: Promise<T>,

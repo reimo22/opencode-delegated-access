@@ -8,7 +8,7 @@ import {
   classifyCommand,
   classifyDirectory,
   type ClassifyFailureClass,
-  type ClassifierSession,
+  type ClassifierGenerator,
 } from "../classifier/classify.ts"
 import {
   runFailureNotificationInBackground,
@@ -34,7 +34,7 @@ import {
  * typing keeps us resilient to minor shape drift — the V2 package root
  * doesn't export domain types directly.)
  */
-export type SessionAccess = ClassifierSession & {
+export type SessionAccess = {
   get(input: { sessionID: string }): Promise<{ parentID?: string } | undefined>
   context(input: {
     sessionID: string
@@ -64,6 +64,7 @@ export type PermissionAccess = {
 export type OpencodeAccess = {
   session: SessionAccess
   permission: PermissionAccess
+  generate: ClassifierGenerator
 }
 
 /**
@@ -99,22 +100,6 @@ export type HandlerContext = {
    * allowed (we just fall back to config-override / latest-assistant-model).
    */
   sessionModel: ModelRef | undefined
-  /**
-   * Track IDs of ephemeral classifier sessions we create. Used by the plugin
-   * entry as a loop-guard: if a permission evaluation's sessionID is in this
-   * set, the plugin skips it (defense-in-depth — the classifier's tools are
-   * cleared in the session context hook and shouldn't request permissions,
-   * but we guard anyway).
-   */
-  ephemeralSessionIDs: Set<string>
-  /**
-   * Registry mapping an ephemeral classifier session ID to the system prompt
-   * it should use, read by the `session.hook("context")` handler in
-   * src/index.ts to REPLACE opencode's global system preamble/instructions
-   * with the classifier prompt (otherwise the classifier inherits e.g. "you
-   * MUST invoke the using-superpowers skill" and never emits a VERDICT).
-   */
-  ephemeralSystemRegistry: import("../classifier/ephemeral-system.ts").EphemeralSystemRegistry
   /**
    * Shared TTL cache for recent SAFE external_directory verdicts. A single
    * instance is held for the plugin's lifetime and shared across all
@@ -432,7 +417,7 @@ async function handleSubjectPermission(args: {
 
   // ---- Classifier call ---------------------------------------------------
   const commonClassifyArgs = {
-    session: ctx.opencode.session,
+    generate: ctx.opencode.generate,
     userMessages,
     parentSessionID: ev.sessionID,
     model,
@@ -441,14 +426,6 @@ async function handleSubjectPermission(args: {
     priorApprovals,
     log,
     retries: ctx.config.classifierRetries,
-    onEphemeralSessionCreated: (id: string, systemPrompt: string) => {
-      ctx.ephemeralSessionIDs.add(id)
-      ctx.ephemeralSystemRegistry.set(id, systemPrompt)
-    },
-    onEphemeralSessionDeleted: (id: string) => {
-      ctx.ephemeralSessionIDs.delete(id)
-      ctx.ephemeralSystemRegistry.delete(id)
-    },
   }
 
   // Capture the FINAL failure class reported by the classifier (after any

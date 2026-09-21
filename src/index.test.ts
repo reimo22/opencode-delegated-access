@@ -76,11 +76,7 @@ async function setupPlugin(options?: Record<string, unknown>) {
     (call) => call[0] === "evaluate",
   )?.[1] as ((ev: unknown) => Promise<void>) | undefined
 
-  const contextHook = session.hook.mock.calls.find(
-    (call) => call[0] === "context",
-  )?.[1] as ((request: unknown) => void) | undefined
-
-  return { evaluate, contextHook, session, permission, event, ctx }
+  return { evaluate, session, permission, event, ctx }
 }
 
 /** One pending subject, as the evaluate path would have seeded it. */
@@ -179,11 +175,10 @@ function riskyPending(
 }
 
 describe("DelegatedAccess setup — V2 hook registration", () => {
-  it("registers the permission evaluate hook, the session context hook, and the event stream", async () => {
-    const { evaluate, contextHook, event } = await setupPlugin()
+  it("registers the permission evaluate hook and the event stream", async () => {
+    const { evaluate, event } = await setupPlugin()
 
     expect(typeof evaluate).toBe("function")
-    expect(typeof contextHook).toBe("function")
     expect(event.subscribe).toHaveBeenCalledTimes(1)
   })
 
@@ -198,18 +193,6 @@ describe("DelegatedAccess setup — V2 hook registration", () => {
     const ctx = mockedHandle.mock.calls[0]?.[1]
     expect(typeof ctx!.log.info).toBe("function")
     expect(ctx!.pendingSubjects).toBeDefined()
-  })
-
-  it("skips evaluations from its own ephemeral classifier sessions (loop guard)", async () => {
-    const { evaluate } = await setupPlugin()
-    mockedHandle.mockImplementationOnce(async (_ev, ctx) => {
-      ctx.ephemeralSessionIDs.add("sess_classifier")
-    })
-
-    await evaluate!(makeEvaluation({ sessionID: ROOT }))
-    await evaluate!(makeEvaluation({ sessionID: "sess_classifier" }))
-
-    expect(mockedHandle).toHaveBeenCalledTimes(1)
   })
 
   it("swallows handler exceptions and leaves effect untouched (fail-closed)", async () => {

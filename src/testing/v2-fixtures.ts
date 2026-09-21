@@ -22,7 +22,6 @@ import { SafePathBatcher } from "../permission/safe-path-batcher.ts"
 import { ApprovalHistoryStore } from "../permission/approval-history.ts"
 import { PendingSubjectsMap } from "../permission/pending-subjects.ts"
 import { FailureNotifyRateLimiter } from "../permission/failure-notify.ts"
-import { EphemeralSystemRegistry } from "../classifier/ephemeral-system.ts"
 import { parseConfig } from "../config.ts"
 import type { NotifyActionResult } from "../notify/notify.ts"
 import type { TranscriptMessage } from "../ui/messages.ts"
@@ -39,22 +38,28 @@ export function makeLogger() {
 }
 
 /**
- * The V2 `ctx.session` slice. `create`/`generate`/`interrupt`/`get`/`context`
- * default to the happy path; individual tests override with
- * `mockResolvedValueOnce`.
+ * The V2 `ctx.session` read slice. The classifier no longer creates sessions,
+ * so only the reads the handler needs remain.
  */
 export function makeSessionDomain() {
   return {
-    create: vi.fn(async (_input?: unknown) => ({ id: "sess_ephemeral" })),
-    generate: vi.fn(async (_input?: unknown) => ({
-      text: "VERDICT: SAFE\nREASON: fixture default",
-    })),
-    interrupt: vi.fn(async (_input?: unknown) => ({})),
     get: vi.fn(async (_input?: unknown) => undefined),
     context: vi.fn(async (_input?: unknown) => [] as TranscriptMessage[]),
-    hook: vi.fn(async (_name: string, _cb: unknown) => ({
-      dispose: async () => {},
-    })),
+  }
+}
+
+/**
+ * The V2 `ctx.generate` slice. `text` defaults to the happy-path classifier
+ * response; individual tests override with `mockResolvedValueOnce`.
+ */
+export function makeGenerateDomain() {
+  return {
+    text: vi.fn(
+      async (
+        _input?: { prompt?: string; model?: { providerID: string; id: string } },
+        _opts?: { signal?: AbortSignal },
+      ) => ({ text: "VERDICT: SAFE\nREASON: fixture default" }),
+    ),
   }
 }
 
@@ -120,6 +125,7 @@ export function makePluginContext(
   overrides: { directory?: string; options?: unknown } = {},
 ) {
   const session = makeSessionDomain()
+  const generate = makeGenerateDomain()
   const permission = makePermissionDomain()
   const event = makeEventStream()
 
@@ -129,12 +135,14 @@ export function makePluginContext(
       location: { directory: overrides.directory ?? "/tmp/repo" },
       options: overrides.options,
       session,
+      generate,
       permission,
       event,
       agent: {},
       shell: {},
     },
     session,
+    generate,
     permission,
     event,
   }
@@ -148,14 +156,13 @@ export function makeHandlerContext(
   overrides: Partial<HandlerContext> = {},
 ): HandlerContext {
   const session = makeSessionDomain()
+  const generate = makeGenerateDomain()
   const permission = makePermissionDomain()
 
   const base: HandlerContext = {
-    opencode: { session, permission } as unknown as OpencodeAccess,
+    opencode: { session, permission, generate } as unknown as OpencodeAccess,
     config: parseConfig(undefined),
     sessionModel: undefined,
-    ephemeralSessionIDs: new Set<string>(),
-    ephemeralSystemRegistry: new EphemeralSystemRegistry(),
     directoryVerdictCache: new DirectoryVerdictCache(),
     approvalHistory: new ApprovalHistoryStore({ maxPerSession: 10 }),
     pendingSubjects: new PendingSubjectsMap(),
